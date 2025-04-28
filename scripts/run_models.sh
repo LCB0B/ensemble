@@ -1,0 +1,1 @@
+python scripts/pretrain_nanoencoder2.py; python scripts/finetune_nanoencoder_risk.py; python scripts/inference_nanoencoder.py

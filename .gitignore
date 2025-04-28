@@ -1,0 +1,67 @@
+# Virtual environments
+venv/
+env/
+ENV/
+.env/
+.venv/
+
+# Data directories
+data/
+*/data/
+
+# Figures and visualizations
+figures/
+plots/
+perplexity_plots/
+
+# Generated outputs
+generated/
+outputs/
+
+# Logs
+logs/
+lightning_logs/
+tb_logs/
+wandb/
+runs/
+*.log
+
+# Model checkpoints
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# LMDB files
+*.lmdb
+*.mdb
+
+# Large parquet files
+*.parquet

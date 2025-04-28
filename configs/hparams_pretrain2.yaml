@@ -1,0 +1,47 @@
+# Vocab info
+# Model info
+# MOST INFO IS NOT USED
+
+d_model: 128
+dim_feedforward: 512 # Not used in nanoGPT, set to 4xd_model
+num_heads: 4
+num_layers: 16
+dropout: 0.1
+bias: False
+
+# Optimizer info
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.1
+learning_rate: 0.0005
+optimizer_warmup_epochs: 2
+
+# Dataloading info
+batch_size: 32
+num_workers: 8
+max_seq_len: 2048
+
+# Some additional info
+max_epochs: 10
+sources: life_test
+background: life_test/background
+experiment_name: pretrain_life
+fname_prefix: pretrain_life
+dir_path: life_test_compiled #data
+precision: 16-mixed
+float32_matmul_precision: medium
+compile: False # Dynamic shapes causes a large amount of recompilations if compiling
+collate_method: flatten_and_expand
+
+# Some additional info
+#CUDA_VISIBLE_DEVICES: 3
+token_freq_cutoff: 100
+experiment_name: stable_pretrain
+cutoff_year: 2018
+include_cls: False
+
+
+include_segment: true
+include_sep: true
+swiglu: True
+load_failed_model: True
