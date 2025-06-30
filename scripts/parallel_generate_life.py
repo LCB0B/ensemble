@@ -1,11 +1,14 @@
 import os
+os.environ["POLARS_MAX_THREADS"] = "4"
+os.environ["RAYON_NUM_THREADS"] = "4"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 import yaml
 import torch
 import warnings
 import pickle
 from pathlib import Path
 import json
-import argparse
 from tqdm import tqdm
 from typing import Optional, List, Dict, Any, Type
 from datetime import datetime
@@ -14,8 +17,6 @@ from datetime import datetime
 from src.datamodule4 import LifeLightningDataModule
 from src.encoder_nano_risk import PretrainNanoEncoder, CausalEncoder
 from src.paths import FPATH
-
-
 
 warnings.filterwarnings("ignore", message="Converting mask without torch.bool dtype to bool")
 
@@ -40,26 +41,6 @@ def load_model_from_checkpoint(
     model.eval()
     print("Model loaded successfully and set to evaluation mode.")
     return model
-
-def _write_buffered_results(sequences_buffer, prompts_buffer, batches_buffer, 
-                           sequences_path, prompts_path, batches_path):
-    """
-    Efficiently write buffered results to disk.
-    """
-    # Load existing data if files exist
-    for buffer, file_path in [(sequences_buffer, sequences_path), 
-                             (prompts_buffer, prompts_path), 
-                             (batches_buffer, batches_path)]:
-        if buffer:  # Only write if buffer has data
-            if file_path.exists():
-                with open(file_path, "rb") as f:
-                    existing = pickle.load(f)
-                existing.extend(buffer)
-            else:
-                existing = list(buffer)
-            
-            with open(file_path, "wb") as f:
-                pickle.dump(existing, f)
 
 def get_dataloader(
     datamodule: LifeLightningDataModule,
@@ -122,12 +103,6 @@ def generate_sequences(
     print("-" * 50)
     print(f"Starting sequence generation with {generation_strategy} strategy...")
     
-    # Initialize data buffers for optimized I/O
-    sequences_buffer = []
-    prompts_buffer = []
-    batches_buffer = []
-    BUFFER_SIZE = 10  # Write every 10 batches to reduce I/O overhead
-    
     # Create output directory
     if output_dir:
         output_dir = Path(output_dir)
@@ -139,6 +114,14 @@ def generate_sequences(
         original_batches_path = output_dir / "original_batches.pkl"
         metadata_path = output_dir / "generation_metadata.json"
         model_card_path = output_dir / "model_card.json"
+        
+        # Initialize files
+        with open(sequences_path, "wb") as f:
+            pickle.dump([], f)
+        with open(prompts_path, "wb") as f:
+            pickle.dump([], f)
+        with open(original_batches_path, "wb") as f:
+            pickle.dump([], f)
     
     # Track generation metadata
     metadata = {
@@ -183,43 +166,54 @@ def generate_sequences(
                 for key, value in batch.items()
             }
             
-            # Generate all simulations at once using batched generation
-            try:
-                # Use optimized batched generation
-                stacked_generations = model.generate_sequence_batched(
-                    batch=batch,
-                    prompt_length=prompt_length,
-                    max_new_tokens=max_new_tokens,
-                    num_simulations=num_simulations,
-                    strategy=generation_strategy
-                )
-                print(f"Generated {num_simulations} simulations for batch {batch_idx+1}")
-                
-            except Exception as e:
-                print(f"Error during batched generation for batch {batch_idx+1}: {e}")
-                stacked_generations = None
+            # Run multiple simulations
+            all_generations = []
+            
+            for sim in range(num_simulations):
+                try:
+                    # Generate sequences
+                    generated = model.generate_sequence(
+                        batch=batch,
+                        prompt_length=prompt_length,
+                        max_new_tokens=max_new_tokens,
+                        strategy=generation_strategy
+                    )
+                    
+                    # Add to collection
+                    all_generations.append(generated)
+                    
+                except Exception as e:
+                    print(f"Error during generation (simulation {sim+1}): {e}")
             
             # Save results for this batch
-            if output_dir and stacked_generations is not None:
+            if output_dir and all_generations:
+                # Stack all simulations into a tensor of shape [batch_size, num_simulations, seq_len]
+                stacked_generations = torch.stack(all_generations, dim=1)
                 
-                # Buffer results instead of immediate file I/O
-                sequences_buffer.append(stacked_generations.cpu())
-                prompts_buffer.append(prompts.cpu())
+                # Save generated sequences
+                with open(sequences_path, "rb") as f:
+                    existing = pickle.load(f)
+                existing.append(stacked_generations.cpu())
+                with open(sequences_path, "wb") as f:
+                    pickle.dump(existing, f)
                 
-                # Remove attn_mask for pickling
+                # Save prompts
+                with open(prompts_path, "rb") as f:
+                    existing = pickle.load(f)
+                existing.append(prompts.cpu())
+                with open(prompts_path, "wb") as f:
+                    pickle.dump(existing, f)
+                
+                # Save original batches
+                #remove the 'attn_mask' key from the original batch (cannot be pickled)
                 original_batch.pop('attn_mask', None)
-                batches_buffer.append(original_batch)
+                with open(original_batches_path, "rb") as f:
+                    existing = pickle.load(f)
+                existing.append(original_batch)
+                with open(original_batches_path, "wb") as f:
+                    pickle.dump(existing, f)
                 
-                # Write to disk when buffer is full or at the end
-                if len(sequences_buffer) >= BUFFER_SIZE or batch_idx == num_batches - 1:
-                    _write_buffered_results(sequences_buffer, prompts_buffer, batches_buffer,
-                                          sequences_path, prompts_path, original_batches_path)
-                    sequences_buffer.clear()
-                    prompts_buffer.clear()
-                    batches_buffer.clear()
-                    print(f"Written buffer to disk (batch {batch_idx+1})")
-                
-                print(f"Processed batch {batch_idx+1} (size: {batch_size})")
+                print(f"Saved batch {batch_idx+1} (size: {batch_size})")
     
     # Finalize results
     if output_dir:
@@ -278,7 +272,6 @@ import os
 import torch
 import argparse
 from pathlib import Path
-
 import subprocess
 import time
 from datetime import datetime
@@ -291,7 +284,8 @@ def launch_parallel_generation(
     base_output_dir: str = None,
     prompt_length: int = 1000,
     max_new_tokens: int = 200,
-    simulations_per_process: int = 25  # Split simulations among processes
+    simulations_per_process: int = 25,  # Split simulations among processes
+    combine_results: bool = True  # New parameter to control combining
 ):
     """
     Launch multiple generation processes in parallel on the same GPU.
@@ -305,18 +299,23 @@ def launch_parallel_generation(
         max_new_tokens: Maximum new tokens to generate
         simulations_per_process: Number of simulations per process
     """
-    # Calculate batches per process
+    ## Calculate batches per process
     batches_per_process = total_batches // num_processes
     
-    # Create base output directory
+    # Create base output directory with the desired format
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    total_simulations = simulations_per_process * num_processes
+    
     if base_output_dir is None:
         from src.paths import FPATH
-        base_output_dir = Path(FPATH.GENERATED) / f"parallel_generation_{timestamp}"
+        # Create directory with the requested format
+        base_output_dir = Path(FPATH.GENERATED) / "stable_pretrain" / f"generated_sequences_parallel_{timestamp}_{prompt_length}_{max_new_tokens}_{total_simulations}"
     else:
         base_output_dir = Path(base_output_dir)
     
     base_output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Base output directory: {base_output_dir}")
+    
     
     # Save configuration
     config = {
@@ -377,7 +376,7 @@ def launch_parallel_generation(
     
     # Monitor processes
     while any(p.poll() is None for p in processes):
-        time.sleep(5)
+        time.sleep(300) 
         statuses = []
         for i, p in enumerate(processes):
             if p.poll() is None:
@@ -405,140 +404,169 @@ def launch_parallel_generation(
         print("Each process directory contains:")
         for i, dir_path in enumerate(process_dirs):
             print(f"  Process {i}: {dir_path}")
+        
+        # Combine results if requested
+        if combine_results:
+            combined_dir = combine_parallel_outputs(base_output_dir)
+            print(f"Combined output directory: {combined_dir}")
+            return combined_dir
     
     return base_output_dir
 
+def combine_parallel_outputs(base_output_dir: Path) -> Path:
+    """
+    Combine outputs from parallel generation processes into a single directory.
+    
+    Args:
+        base_output_dir: Path to the base output directory containing process_X subdirectories
+        
+    Returns:
+        Path to the combined output directory
+    """
+    print(f"Combining outputs from {base_output_dir}...")
+    
+    # Create combined directory
+    combined_dir = base_output_dir
+    combined_dir.mkdir(exist_ok=True)
+    
+    # Find all process directories
+    process_dirs = sorted([d for d in base_output_dir.glob("process_*") if d.is_dir()])
+    
+    if not process_dirs:
+        print("No process directories found!")
+        return base_output_dir
+    
+    print(f"Found {len(process_dirs)} process directories")
+    
+    # Initialize empty lists for combined data
+    all_sequences = []
+    all_prompts = []
+    all_original_batches = []
+    total_sequences = 0
+    total_batches = 0
+    generation_params = None
+    model_info = None
+    
+    # Process each directory
+    for process_dir in process_dirs:
+        print(f"Processing {process_dir}")
+        
+        # Load sequences
+        sequences_path = process_dir / "generated_sequences.pkl"
+        if sequences_path.exists():
+            with open(sequences_path, "rb") as f:
+                sequences = pickle.load(f)
+                all_sequences.extend(sequences)
+        
+        # Load prompts
+        prompts_path = process_dir / "prompts.pkl"
+        if prompts_path.exists():
+            with open(prompts_path, "rb") as f:
+                prompts = pickle.load(f)
+                all_prompts.extend(prompts)
+        
+        # Load original batches
+        original_batches_path = process_dir / "original_batches.pkl"
+        if original_batches_path.exists():
+            with open(original_batches_path, "rb") as f:
+                batches = pickle.load(f)
+                all_original_batches.extend(batches)
+        
+        # Load metadata to aggregate statistics
+        metadata_path = process_dir / "generation_metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+                total_sequences += metadata.get("total_sequences", 0)
+                total_batches += metadata.get("batches_processed", 0)
+                generation_params = generation_params or {
+                    k: v for k, v in metadata.items() 
+                    if k in ["max_new_tokens", "prompt_length", "generation_strategy"]
+                }
+        
+        # Get model info from any process (should be the same in all)
+        if not model_info:
+            model_card_path = process_dir / "model_card.json"
+            if model_card_path.exists():
+                with open(model_card_path, "r") as f:
+                    model_info = json.load(f)
+    
+    # Save combined sequences
+    print("Saving combined sequences...")
+    with open(combined_dir / "generated_sequences.pkl", "wb") as f:
+        pickle.dump(all_sequences, f)
+    
+    # Save combined prompts
+    print("Saving combined prompts...")
+    with open(combined_dir / "prompts.pkl", "wb") as f:
+        pickle.dump(all_prompts, f)
+    
+    # Save combined original batches
+    print("Saving combined original batches...")
+    with open(combined_dir / "original_batches.pkl", "wb") as f:
+        pickle.dump(all_original_batches, f)
+    
+    # Save combined metadata
+    combined_metadata = {
+        "total_sequences": total_sequences,
+        "batches_processed": total_batches,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "combined_from_processes": len(process_dirs)
+    }
+    
+    # Add generation parameters if available
+    if generation_params:
+        combined_metadata.update(generation_params)
+    
+    with open(combined_dir / "generation_metadata.json", "w") as f:
+        json.dump(combined_metadata, f, indent=2)
+    
+    # Save model card
+    if model_info:
+        with open(combined_dir / "model_card.json", "w") as f:
+            json.dump(model_info, f, indent=2)
+    
+    # Copy parallel config file if exists
+    config_path = base_output_dir / "parallel_config.json"
+    if config_path.exists():
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        with open(combined_dir / "parallel_config.json", "w") as f:
+            json.dump(config, f, indent=2)
+    
+    print(f"Combined data saved to {combined_dir}")
+    
+    # Delete original process directories to save space
+    print("Deleting temporary process directories...")
+    for process_dir in process_dirs:
+        import shutil
+        shutil.rmtree(process_dir)
+    
+    print("Cleanup complete!")
+    return combined_dir
 
-
-# Add a batch skipper function to start from a specific batch index
-def batch_skipper(dataloader, start_batch):
-    """Skip to the specified batch index"""
-    for i, batch in enumerate(dataloader):
-        if i >= start_batch:
-            yield batch
-
+# Modify the main function to accept command-line arguments
 if __name__ == "__main__":
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description="Generate life sequences")
-    parser.add_argument("--num_batches", type=int, default=10, help="Number of batches to process")
-    parser.add_argument("--start_batch", type=int, default=0, help="Starting batch index")
+    parser = argparse.ArgumentParser(description="Run parallel sequence generation")
+    parser.add_argument("--processes", type=int, default=6, help="Number of parallel processes")
+    parser.add_argument("--total_batches", type=int, default=6, help="Total batches to process")
+    parser.add_argument("--gpu_id", type=int, default=0, help="GPU ID to use")
     parser.add_argument("--prompt_length", type=int, default=1000, help="Prompt length")
-    parser.add_argument("--max_new_tokens", type=int, default=1000, help="Maximum new tokens")
-    parser.add_argument("--num_simulations", type=int, default=200, help="Number of simulations")
-    parser.add_argument("--output_dir", type=str, default=None, help="Output directory")
-    parser.add_argument("--experiment_subdir", type=str, default="8192", help="Experiment subdirectory for checkpoint/hparams")
-    parser.add_argument("--experiment_name", type=str, default="stable_pretrain", help="Experiment name")
-    parser.add_argument("--data_dir", type=str, default="life_all_compiled", help="Data directory name")
+    parser.add_argument("--max_new_tokens", type=int, default=200, help="Max new tokens")
+    parser.add_argument("--simulations_per_process", type=int, default=200, help="Simulations per process")
+    parser.add_argument("--no_combine", action="store_true", help="Don't combine results (keep separate process folders)")
     
     args = parser.parse_args()
     
-    # ----- Configuration using FPATH -----
-    # Load hparams from logs using configurable paths
-    EXPERIMENT_NAME = args.experiment_name
-    EXPERIMENT_SUBDIR = args.experiment_subdir
-    HPARAMS_PATH = FPATH.TB_LOGS / EXPERIMENT_NAME / EXPERIMENT_SUBDIR / 'hparams.yaml'
-    CHECKPOINT_NAME = "last.ckpt"
-    CHECKPOINT_PATH = FPATH.CHECKPOINTS / EXPERIMENT_NAME / EXPERIMENT_SUBDIR / CHECKPOINT_NAME
-    DATA_DIR_PATH = FPATH.DATA / args.data_dir
-
-    if not HPARAMS_PATH.exists():
-        raise FileNotFoundError(f"Hparams file not found: {HPARAMS_PATH}")
-    
-    with open(HPARAMS_PATH, "r") as stream: 
-        hparams = yaml.safe_load(stream)
-
-    # Model configuration
-    MODEL_CLASS = CausalEncoder
-    STAGE = 'predict'
-    BATCH_SIZE = 32
-    DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-    GENERATION_STRATEGY = "top_p"
-    
-    # Use command-line arguments or defaults
-    NUM_BATCHES = args.num_batches
-    START_BATCH = args.start_batch
-    PROMPT_LENGTH = args.prompt_length
-    MAX_NEW_TOKENS = args.max_new_tokens
-    NUM_SIMULATIONS = args.num_simulations
-    
-    # Output directory using FPATH
-    if args.output_dir:
-        # If absolute path provided, use it; if relative, make it relative to GENERATED
-        if Path(args.output_dir).is_absolute():
-            OUTPUT_DIR = Path(args.output_dir)
-        else:
-            OUTPUT_DIR = FPATH.GENERATED / args.output_dir
-    else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        OUTPUT_DIR = FPATH.GENERATED / EXPERIMENT_NAME / f"generated_sequences_{timestamp}_{PROMPT_LENGTH}_{MAX_NEW_TOKENS}_{NUM_SIMULATIONS}"
-    
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"Output directory: {OUTPUT_DIR}")
-    
-    # ----- Load background data -----
-    background = None
-    BACKGROUND_PATH = FPATH.DATA / hparams.get('sources', '') / "background.parquet"
-    if BACKGROUND_PATH.exists():
-        import polars as pl
-        print(f"Loading background data from {BACKGROUND_PATH}")
-        background = pl.read_parquet(BACKGROUND_PATH)
-    
-    # ----- Setup -----
-    print("Instantiating DataModule...")
-    datamodule = LifeLightningDataModule(
-        dir_path=DATA_DIR_PATH,
-        lmdb_path=DATA_DIR_PATH / "dataset.lmdb",
-        vocab_path=DATA_DIR_PATH / "vocab.json",
-        pnr_to_idx_path=DATA_DIR_PATH / "pnr_to_database_idx.json",
-        background=background,
-        cls_token=True,
-        sep_token=False,
-        segment=False,
-        max_seq_len=hparams["max_seq_len"],
-        batch_size=BATCH_SIZE,
-        num_workers=0
+    # Launch parallel generation
+    output_dir = launch_parallel_generation(
+        num_processes=args.processes,
+        total_batches=args.total_batches,
+        gpu_id=args.gpu_id,
+        prompt_length=args.prompt_length,
+        max_new_tokens=args.max_new_tokens,
+        simulations_per_process=args.simulations_per_process,
+        combine_results=not args.no_combine
     )
     
-    # Load model
-    model = load_model_from_checkpoint(
-        model_class=MODEL_CLASS,
-        checkpoint_path=CHECKPOINT_PATH,
-        hparams=hparams,
-        device=DEVICE
-    )
-    
-    # Get dataloader
-    dataloader = get_dataloader(datamodule=datamodule, stage=STAGE)
-    
-    # Prepare model information
-    model_info = {
-        "model_name": MODEL_CLASS.__name__,
-        "experiment_name": EXPERIMENT_NAME,
-        "checkpoint_path": str(CHECKPOINT_PATH),
-        "hparams": {
-            key: value for key, value in hparams.items() 
-            if isinstance(value, (str, int, float, bool, list, dict))
-        }
-    }
-    
-    # ----- Generate sequences -----
-    metadata = generate_sequences(
-        model=model,
-        dataloader=batch_skipper(dataloader, START_BATCH),  # Use batch skipper to start from START_BATCH
-        datamodule=datamodule,
-        device=DEVICE,
-        prompt_length=PROMPT_LENGTH,
-        max_new_tokens=MAX_NEW_TOKENS,
-        num_simulations=NUM_SIMULATIONS,
-        num_batches=NUM_BATCHES,
-        generation_strategy=GENERATION_STRATEGY,
-        output_dir=OUTPUT_DIR,
-        model_info=model_info
-    )
-    
-    # ----- Print summary -----
-    print("\n=== Generation Summary ===")
-    print(f"Total sequences: {metadata['total_sequences']}")
-    print(f"Batches processed: {metadata['batches_processed']}")
-    print(f"Output directory: {OUTPUT_DIR}")
-    print("=========================")
+    print(f"Output directory: {output_dir}")

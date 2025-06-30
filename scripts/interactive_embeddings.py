@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# filepath: /home/louibo/ensemble/scripts/interactive_embeddings.py
 
 import os
 import json
