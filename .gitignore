@@ -17,7 +17,7 @@ perplexity_plots/
 # Generated outputs
 generated/
 outputs/
-
+plot/ 
 # Logs
 logs/
 lightning_logs/
