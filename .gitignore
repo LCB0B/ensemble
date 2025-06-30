@@ -65,3 +65,8 @@ htmlcov/
 
 # Large parquet files
 *.parquet
+
+
+#Claude
+CLAUDE.md
+MODIFICATIONS.md
