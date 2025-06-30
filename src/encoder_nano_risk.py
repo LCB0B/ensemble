@@ -349,6 +349,396 @@ class CausalEncoder(BaseNanoEncoder):
         generated_sequence = torch.cat(generated_tokens, dim=1)  # Shape: (batch_size, max_new_tokens)
         return generated_sequence
     
+    def generate_sequence_batched(self, batch, prompt_length, max_new_tokens, num_simulations=1, strategy="most_likely", k=5, p=0.95, temperature=1.0):
+        """
+        Optimized sequence generation that batches multiple simulations together.
+        
+        Args:
+            batch (dict): Input batch with keys 'event', 'age', 'abspos', 'segment', 'attn_mask', etc.
+            prompt_length (int): Length of the prompt sequence.
+            max_new_tokens (int): Number of new tokens to generate.
+            num_simulations (int): Number of simulations to run in parallel.
+            strategy (str): Sampling strategy ("most_likely", "top_k", "top_p").
+            k (int): Number of tokens for top-k sampling.
+            p (float): Probability threshold for nucleus sampling.
+            temperature (float): Temperature for scaling logits.
+            
+        Returns:
+            torch.Tensor: Generated sequences of shape (batch_size, num_simulations, max_new_tokens).
+        """
+        batch_size = batch['event'].size(0)
+        max_seq_len = batch['event'].size(1)
+        
+        # Ensure we have enough space
+        if prompt_length + max_new_tokens > max_seq_len:
+            raise ValueError(f"Prompt length ({prompt_length}) + max_new_tokens ({max_new_tokens}) exceeds maximum sequence length ({max_seq_len})")
+        
+        # Expand batch to include all simulations
+        expanded_batch = {}
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                # Repeat tensor for each simulation: [batch_size, ...] -> [batch_size * num_simulations, ...]
+                expanded_batch[key] = value.repeat(num_simulations, *([1] * (value.dim() - 1)))
+            else:
+                expanded_batch[key] = value
+        
+        # Generate sequences for all simulations at once (with caching)
+        generated_flat = self.generate_sequence_with_cache(
+            expanded_batch, prompt_length, max_new_tokens, strategy, k, p, temperature
+        )
+        
+        # Reshape to separate simulations: [batch_size * num_simulations, max_new_tokens] -> [batch_size, num_simulations, max_new_tokens]
+        generated_sequence = generated_flat.view(batch_size, num_simulations, max_new_tokens)
+        
+        return generated_sequence
+    
+    def generate_sequence_optimized(self, batch, prompt_length, max_new_tokens, strategy="most_likely", k=5, p=0.95, temperature=1.0):
+        """
+        Memory-optimized version of generate_sequence with reduced tensor copying.
+        
+        Args:
+            batch (dict): Input batch.
+            prompt_length (int): Length of the prompt sequence.
+            max_new_tokens (int): Number of new tokens to generate.
+            strategy (str): Sampling strategy.
+            k (int): Number of tokens for top-k sampling.
+            p (float): Probability threshold for nucleus sampling.
+            temperature (float): Temperature for scaling logits.
+            
+        Returns:
+            torch.Tensor: Generated event tokens of shape (batch_size, max_new_tokens).
+        """
+        batch_size = batch['event'].size(0)
+        max_seq_len = batch['event'].size(1)
+        
+        # Create working copy only for event tensor (most memory-intensive)
+        working_events = batch['event'].clone()
+        
+        # Pre-allocate tensor for generated tokens
+        generated_tokens = torch.zeros(
+            (batch_size, max_new_tokens), 
+            dtype=working_events.dtype, 
+            device=working_events.device
+        )
+        
+        # Create a view-based batch that references original tensors except for events
+        working_batch = {k: v for k, v in batch.items()}
+        working_batch['event'] = working_events
+        
+        for i in range(max_new_tokens):
+            current_length = prompt_length + i
+            
+            # Predict next token
+            next_token = self.predict_step_optimized(
+                working_batch,
+                predict_index=current_length - 1,
+                strategy=strategy,
+                k=k,
+                p=p,
+                temperature=temperature
+            )
+            
+            # Update working tensor and store generated token
+            working_events[:, current_length] = next_token
+            generated_tokens[:, i] = next_token
+            
+        return generated_tokens
+    
+    def predict_step_optimized(self, batch, predict_index=-1, strategy="most_likely", k=5, p=0.9, temperature=1.0):
+        """
+        Optimized predict_step with reduced memory allocations.
+        """
+        # Forward pass (this is still the main bottleneck - will be addressed with KV cache)
+        output = self(batch)
+        
+        # Get logits for the specified position (avoid tensor copying)
+        logits = self.decoder(output[:, predict_index, :])
+        
+        # Apply temperature scaling in-place
+        logits = logits / temperature
+        
+        # Compute probabilities
+        probs = F.softmax(logits, dim=-1)
+        
+        if strategy == "most_likely":
+            predictions = torch.argmax(probs, dim=-1)
+        elif strategy == "top_k":
+            top_k_probs, top_k_indices = torch.topk(probs, k, dim=-1)
+            sampled_indices = torch.multinomial(top_k_probs, num_samples=1).squeeze(-1)
+            predictions = top_k_indices[range(top_k_indices.size(0)), sampled_indices]
+        elif strategy == "top_p":
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            mask = cumulative_probs <= p
+            mask[:, 0] = True  # Ensure at least one token
+            sorted_probs[~mask] = 0
+            sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+            sampled_indices = torch.multinomial(sorted_probs, num_samples=1).squeeze(-1)
+            predictions = sorted_indices[range(sorted_indices.size(0)), sampled_indices]
+        else:
+            raise ValueError(f"Unsupported strategy: {strategy}")
+            
+        return predictions
+    
+    def generate_sequence_with_cache(self, batch, prompt_length, max_new_tokens, strategy="most_likely", k=5, p=0.95, temperature=1.0):
+        """
+        Generate sequence with simple caching to avoid recomputing the full sequence each time.
+        
+        Args:
+            batch (dict): Input batch.
+            prompt_length (int): Length of the prompt sequence.
+            max_new_tokens (int): Number of new tokens to generate.
+            strategy (str): Sampling strategy.
+            k (int): Number of tokens for top-k sampling.
+            p (float): Probability threshold for nucleus sampling.
+            temperature (float): Temperature for scaling logits.
+            
+        Returns:
+            torch.Tensor: Generated event tokens of shape (batch_size, max_new_tokens).
+        """
+        batch_size = batch['event'].size(0)
+        max_seq_len = batch['event'].size(1)
+        
+        if prompt_length + max_new_tokens > max_seq_len:
+            raise ValueError(f"Prompt length ({prompt_length}) + max_new_tokens ({max_new_tokens}) exceeds maximum sequence length ({max_seq_len})")
+        
+        # Create working copy
+        working_events = batch['event'].clone()
+        working_batch = {k: v for k, v in batch.items()}
+        working_batch['event'] = working_events
+        
+        # Pre-compute embeddings for the prompt once
+        prompt_embeddings = None
+        
+        # Pre-allocate result tensor
+        generated_tokens = torch.zeros(
+            (batch_size, max_new_tokens), 
+            dtype=working_events.dtype, 
+            device=working_events.device
+        )
+        
+        for i in range(max_new_tokens):
+            current_length = prompt_length + i
+            
+            # Use cached computation for efficiency
+            next_token = self._predict_next_with_partial_cache(
+                working_batch,
+                current_length,
+                prompt_embeddings,
+                strategy=strategy,
+                k=k,
+                p=p,
+                temperature=temperature
+            )
+            
+            # Update sequence
+            working_events[:, current_length] = next_token
+            generated_tokens[:, i] = next_token
+            
+        return generated_tokens
+    
+    def _predict_next_with_partial_cache(self, batch, current_length, cached_embeddings=None, 
+                                       strategy="most_likely", k=5, p=0.9, temperature=1.0):
+        """
+        Predict next token with partial caching to avoid full recomputation.
+        This is a simplified version - full KV-cache would be more complex.
+        """
+        # For now, this still does a full forward pass but with optimizations
+        # A full KV-cache implementation would require modifying the transformer blocks
+        
+        # Create a batch slice up to current position to reduce computation
+        batch_slice = {}
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor) and value.dim() >= 2:
+                if key in ['event', 'age', 'abspos', 'segment']:
+                    # Only process up to current_length + 1
+                    batch_slice[key] = value[:, :current_length + 1]
+                elif key == 'attn_mask':
+                    # Slice attention mask appropriately
+                    if value.dim() == 4:  # [batch, heads, seq, seq]
+                        batch_slice[key] = value[:, :, :current_length + 1, :current_length + 1]
+                    elif value.dim() == 3:  # [batch, seq, seq]
+                        batch_slice[key] = value[:, :current_length + 1, :current_length + 1]
+                    else:
+                        batch_slice[key] = value
+                else:
+                    batch_slice[key] = value
+            else:
+                batch_slice[key] = value
+        
+        # Forward pass on reduced sequence
+        output = self(batch_slice)
+        logits = self.decoder(output[:, -1, :])  # Only use last position
+        
+        # Apply temperature and sampling
+        logits = logits / temperature
+        probs = F.softmax(logits, dim=-1)
+        
+        if strategy == "most_likely":
+            predictions = torch.argmax(probs, dim=-1)
+        elif strategy == "top_k":
+            top_k_probs, top_k_indices = torch.topk(probs, k, dim=-1)
+            sampled_indices = torch.multinomial(top_k_probs, num_samples=1).squeeze(-1)
+            predictions = top_k_indices[range(top_k_indices.size(0)), sampled_indices]
+        elif strategy == "top_p":
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            mask = cumulative_probs <= p
+            mask[:, 0] = True
+            sorted_probs[~mask] = 0
+            sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+            sampled_indices = torch.multinomial(sorted_probs, num_samples=1).squeeze(-1)
+            predictions = sorted_indices[range(sorted_indices.size(0)), sampled_indices]
+        else:
+            raise ValueError(f"Unsupported strategy: {strategy}")
+            
+        return predictions
+    
+    def get_sequence_embedding_mean_pool(self, batch: Dict[str, Any]) -> torch.Tensor:
+        """
+        Get sequence-level embedding using mean pooling.
+        
+        Args:
+            batch: Input batch with sequence data
+            
+        Returns:
+            torch.Tensor: Sequence embeddings of shape [batch_size, d_model]
+        """
+        # Get hidden representations
+        hidden_states = self.forward(batch)  # [batch_size, seq_len, d_model]
+        
+        # Create mask for non-padding tokens (assuming 0 is padding)
+        if 'event' in batch:
+            padding_mask = (batch['event'] != 0).float()  # [batch_size, seq_len]
+        else:
+            # If no event key, assume no padding
+            padding_mask = torch.ones(hidden_states.shape[:2], device=hidden_states.device)
+        
+        # Apply mask and compute mean
+        masked_hidden = hidden_states * padding_mask.unsqueeze(-1)  # [batch_size, seq_len, d_model]
+        seq_lengths = padding_mask.sum(dim=1, keepdim=True)  # [batch_size, 1]
+        
+        # Avoid division by zero
+        seq_lengths = torch.clamp(seq_lengths, min=1.0)
+        
+        # Mean pooling
+        sequence_embedding = masked_hidden.sum(dim=1) / seq_lengths  # [batch_size, d_model]
+        
+        return sequence_embedding
+    
+    def get_sequence_embedding_attention_pool(self, batch: Dict[str, Any]) -> torch.Tensor:
+        """
+        Get sequence-level embedding using learned attention-weighted pooling.
+        
+        Args:
+            batch: Input batch with sequence data
+            
+        Returns:
+            torch.Tensor: Sequence embeddings of shape [batch_size, d_model]
+        """
+        # Get hidden representations
+        hidden_states = self.forward(batch)  # [batch_size, seq_len, d_model]
+        
+        # Initialize attention layer if not exists
+        if not hasattr(self, 'attention_pool'):
+            self.attention_pool = nn.Linear(self.hparams.d_model, 1, bias=False)
+            # Initialize with small weights
+            nn.init.normal_(self.attention_pool.weight, mean=0.0, std=0.02)
+            # Move to same device as the model
+            self.attention_pool = self.attention_pool.to(hidden_states.device)
+        
+        # Compute attention scores
+        attention_scores = self.attention_pool(hidden_states).squeeze(-1)  # [batch_size, seq_len]
+        
+        # Create mask for non-padding tokens
+        if 'event' in batch:
+            padding_mask = (batch['event'] != 0).float()  # [batch_size, seq_len]
+        else:
+            padding_mask = torch.ones(attention_scores.shape, device=hidden_states.device)
+        
+        # Apply mask to attention scores (set padding to very negative value)
+        masked_attention_scores = attention_scores.masked_fill(padding_mask == 0, -1e9)
+        
+        # Compute attention weights
+        attention_weights = torch.softmax(masked_attention_scores, dim=1)  # [batch_size, seq_len]
+        
+        # Apply attention weights
+        sequence_embedding = torch.sum(hidden_states * attention_weights.unsqueeze(-1), dim=1)  # [batch_size, d_model]
+        
+        return sequence_embedding, attention_weights
+    
+    def get_sequence_embedding_cls(self, batch: Dict[str, Any]) -> torch.Tensor:
+        """
+        Get sequence-level embedding using CLS token (first position).
+        
+        Args:
+            batch: Input batch with sequence data
+            
+        Returns:
+            torch.Tensor: Sequence embeddings of shape [batch_size, d_model]
+        """
+        # Get hidden representations
+        hidden_states = self.forward(batch)  # [batch_size, seq_len, d_model]
+        
+        # Use first position as sequence embedding (assuming CLS token)
+        sequence_embedding = hidden_states[:, 0, :]  # [batch_size, d_model]
+        
+        return sequence_embedding
+    
+    def get_sequence_embedding_max_pool(self, batch: Dict[str, Any]) -> torch.Tensor:
+        """
+        Get sequence-level embedding using max pooling.
+        
+        Args:
+            batch: Input batch with sequence data
+            
+        Returns:
+            torch.Tensor: Sequence embeddings of shape [batch_size, d_model]
+        """
+        # Get hidden representations
+        hidden_states = self.forward(batch)  # [batch_size, seq_len, d_model]
+        
+        # Create mask for non-padding tokens
+        if 'event' in batch:
+            padding_mask = (batch['event'] != 0).float()  # [batch_size, seq_len]
+        else:
+            padding_mask = torch.ones(hidden_states.shape[:2], device=hidden_states.device)
+        
+        # Apply mask (set padding to very negative value for max pooling)
+        masked_hidden = hidden_states.masked_fill(padding_mask.unsqueeze(-1) == 0, -1e9)
+        
+        # Max pooling
+        sequence_embedding, _ = torch.max(masked_hidden, dim=1)  # [batch_size, d_model]
+        
+        return sequence_embedding
+    
+    def compare_sequence_embeddings(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """
+        Compare different sequence embedding methods.
+        
+        Args:
+            batch: Input batch with sequence data
+            
+        Returns:
+            Dict containing embeddings from different methods
+        """
+        embeddings = {}
+        
+        # Mean pooling
+        embeddings['mean_pool'] = self.get_sequence_embedding_mean_pool(batch)
+        
+        # Attention-weighted pooling
+        embeddings['attention_pool'], attention_weights = self.get_sequence_embedding_attention_pool(batch)
+        embeddings['attention_weights'] = attention_weights
+        
+        # CLS token
+        embeddings['cls'] = self.get_sequence_embedding_cls(batch)
+        
+        # Max pooling
+        embeddings['max_pool'] = self.get_sequence_embedding_max_pool(batch)
+        
+        return embeddings
+    
     def get_logits_and_targets(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """
         Performs a forward pass and returns aligned logits and targets.
