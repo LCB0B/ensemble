@@ -1,71 +1,83 @@
 """ Implements all collate functionality """
 
-import bisect
-import itertools
-from typing import List, Dict, Any, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Union, Literal
+
 import torch
-from src.utils import get_max_special_token_value, mask_inputs
+
+from src.collate_utils import (
+    calc_age_from_abspos,
+    censor_data,
+    censor_person,
+    combine_and_sort_family_seq,
+    mask_inputs,
+)
 
 
 class Collate:
     """Implements the core collate functions"""
 
-    def __init__(self, truncate_length=512, background_length=0, segment=False):
-        self.truncate_length = truncate_length
+    def __init__(self, max_seq_len=512, background_length=0, **kwargs):
+        self.max_seq_len = max_seq_len
+        self.truncate_length = max_seq_len - background_length
         self.background_length = background_length
-        self.max_seq_len = truncate_length + background_length
-        self.bg_events = int(self.background_length > 0)
-        self.segment = segment
+        self.bg_events = int(background_length > 0)
+        self.data_keys = ["event", "age", "abspos", "segment"]
 
-    def __call__(self, batch: List[dict]) -> dict:
-        data_keys = [key for key in batch[0]] + ["segment"] * int(self.segment)
-        output = {
-            key: []
-            for key in data_keys + ["last_data_idx", "event_lens", "event_borders"]
-        }
+    def __call__(self, batch: Dict[str, List]) -> dict:
+        return self.main(batch)
 
-        for person in batch:
-            # First start with events to get required stuff for the others
-            person_seq, person_event_lens, event_border = self._flatten(
-                person.pop("event")
-            )
-            output["event"].append(person_seq)
+    def main(self, batch: Dict[str, List[dict]]) -> dict:
+        """The main processing function"""
+        output = {key: [] for key in self.data_keys}
 
-            # Add additional info
-            output["last_data_idx"].append(len(person_seq))
-
-            if self.segment:
-                person["segment"] = list(range(1, len(person_event_lens) + 1))
-
-            for key in person:
-                truncated_seq = self._truncate(person[key], event_border)
-                expanded_seq = self.expand(truncated_seq, person_event_lens)
-                output[key].append(expanded_seq)
-
-            # Only needed for other collates
-            output["event_borders"].append(event_border)
-            output["event_lens"].append(person_event_lens)
+        for person in batch["data"]:
+            indv = self.process_person(person)
+            for key, v in indv.items():
+                output[key].append(v)
 
         # Pad all person keys
-        for key in data_keys:
+        for key in self.data_keys:
             output[key] = self._pad(output[key])
-        output["last_data_idx"] = torch.as_tensor(output["last_data_idx"])
 
         return output
 
-    def _truncate(self, seq, event_border: int):
-        background = [] if event_border is None else seq[: self.bg_events]
-        return background + seq[event_border:]
+    def process_person(self, person, truncate_length: int = None):
+        """Handles all person-specific processsing"""
+        output = {}
+        truncate_length = (
+            truncate_length if truncate_length is not None else self.truncate_length
+        )
+        # Start with events
+        person_seq, person_event_lens, event_border = self._flatten(
+            person.pop("event"),
+            truncate_length=truncate_length,
+        )
+        output["event"] = person_seq
+
+        person["segment"] = list(range(1, len(person_event_lens) + 1))
+        # Add rest of keys
+        repeats = torch.as_tensor(person_event_lens)
+        for key in person:
+            truncated_seq = self._truncate(person[key], event_border)
+            expanded_seq = self.expand(truncated_seq, repeats)
+            output[key] = expanded_seq
+        return output
+
+    def _truncate(self, seq: list, event_border: int):
+        if event_border is None:
+            return seq
+        return seq[: self.bg_events] + seq[event_border:]
 
     @staticmethod
-    def expand(seq: list, repeats: list) -> torch.Tensor:
+    def expand(seq: list, repeats: torch.Tensor) -> torch.Tensor:
         """Repeats seq[i] repeats[i] times"""
-        return torch.repeat_interleave(torch.as_tensor(seq), torch.as_tensor(repeats))
+        dtype = torch.int32 if isinstance(seq[0], int) else torch.float32
+        return torch.repeat_interleave(torch.as_tensor(seq, dtype=dtype), repeats)
 
-    def _flatten(self, events: List[List[int]]):
+    def _flatten(self, events: List[List[int]], truncate_length: int):
         """Flattens events and (optional) truncates, returning flatten_seq and the last event idx"""
         person_seq, person_event_lens, event_border = (
-            self._flatten_reverse_and_truncate(events, self.truncate_length)
+            self._flatten_reverse_and_truncate(events, truncate_length)
         )
         return person_seq, person_event_lens, event_border
 
@@ -84,7 +96,7 @@ class Collate:
             result.extend(sublist[::-1])
         else:  # If loop finished (total_length < truncate_length)
             return result[::-1], event_lens[::-1], None
-        # TODO: This breaks with CLS token
+
         # Add background onto it
         for sublist in reversed(sequence[: self.bg_events]):
             result.extend(sublist[::-1])
@@ -95,35 +107,15 @@ class Collate:
         self,
         sequence: Union[list, torch.Tensor],
         dtype: torch.dtype = None,
-        padding_value=0,
+        **pad_kwargs,
     ) -> torch.Tensor:
-        """Pads the sequence (using padding_value) to closest defined lens and converts to tensor"""
-        # Initialize lens buckets
-        lens = [128 * (2**i) for i in range((self.max_seq_len // 128).bit_length())]
-        if self.max_seq_len not in lens:
-            lens.append(self.max_seq_len)
-
-        # Conver to tensors and get max_len and max_idx
-        sequences = [torch.as_tensor(seq, dtype=dtype) for seq in sequence]
-        max_len, max_idx = torch.max(
-            torch.tensor([s.size(0) for s in sequences]), dim=0
-        )
-
-        # If batch does not match a predefined len
-        if max_len.values not in lens:
-            closest_len = lens[bisect.bisect_left(lens, max_len)]
-            extra_dims = sequences[max_idx].shape[1:]
-            sequences[max_idx] = torch.cat(
-                (
-                    sequences[max_idx],
-                    torch.full((closest_len - max_len, *extra_dims), padding_value),
-                )
-            )
+        """Pads the sequence (using pad_kwargs) converts to tensor"""
+        # Convert to tensors and pad with dtype conversion
+        if not torch.is_tensor(sequence[0]) or dtype != sequence[0].dtype:
+            sequence = [torch.as_tensor(seq, dtype=dtype) for seq in sequence]
         return torch.nn.utils.rnn.pad_sequence(
-            sequences,
-            batch_first=True,
-            padding_value=padding_value,
-        )
+            sequence, batch_first=True, **pad_kwargs
+        ).to(dtype)
 
 
 class MaskCollate(Collate):
@@ -131,343 +123,314 @@ class MaskCollate(Collate):
 
     def __init__(
         self,
+        *args,
         vocab: dict,
         mask_prob=0.15,
         replace_prob=0.8,
         random_prob=0.1,
-        truncate_length=512,
-        background_length=0,
-        segment=False,
+        **kwargs,
     ):
-        super().__init__(truncate_length, background_length, segment=segment)
+        super().__init__(*args, **kwargs)
         self.vocab = vocab
         self.mask_prob = mask_prob
         self.replace_prob = replace_prob
         self.random_prob = random_prob
-        self.special_token_border = get_max_special_token_value(vocab)
 
-    def __call__(self, batch: List[Dict]) -> Dict:
-        batch = super().__call__(batch)
+    def __call__(self, batch: Dict[str, List]) -> dict:
+        output = self.main(batch)
 
         # Mask events and produce targets
-        batch["event"], batch["target"] = mask_inputs(
-            batch["event"],
+        output["event"], output["target"] = mask_inputs(
+            output["event"],
             self.vocab,
             mask_prob=self.mask_prob,
             replace_prob=self.replace_prob,
             random_prob=self.random_prob,
-            special_token_border=self.special_token_border,
         )
-        return batch
+        return output
+
+
+class AutoregressiveCollate(Collate):
+    """Standard collate with Autoregressive shift"""
+
+    def __call__(self, batch):
+        output = self.main(batch)
+
+        output["target"] = output["event"][:, 1:]
+        output["target"] = output["target"].masked_fill(output["target"] == 0, -100)
+        for feature in ["event", "abspos", "age", "segment"]:
+            output[feature] = output[feature][:, :-1]
+        return output
 
 
 class CensorCollate(Collate):
     """Standard collate with censoring"""
 
-    def __init__(
-        self,
-        truncate_length: int,
-        background_length: int,
-        segment: bool,
-        negative_censor: int = 0,
-    ):
-        super().__init__(truncate_length, background_length, segment=segment)
-        self.negative_censor = negative_censor
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-    def __call__(self, batch: Tuple[List[Dict]]) -> Dict:
+    def __call__(self, batch: Dict[str, List]) -> dict:
         """Input: List of Batch, Outcomes"""
-        data, outcome_info = batch
-        data = self._censor(data, outcome_info)
+        batch["data"] = self._censor_data(batch)
 
-        batch = super().__call__(data)
-        batch = self._add_outcome_info(batch, outcome_info)
-        return batch
+        output = self.main(batch)
+        output = self._add_outcome_info(output, batch["outcome_info"])
+        return output
 
-    def _censor(self, data: Tuple[Dict], outcome_info: Tuple[Dict]) -> List[Dict]:
-        censored_data = []
-        for person, outcome in zip(data, outcome_info, strict=True):
-            abspos = person["abspos"]
-            censor_abspos = outcome["censor"]
-            if censor_abspos is None:
-                censor_abspos = (
-                    abspos[-1] + 1e-10  # Tiny float adjust if self.negative_censor=0
-                ) - self.negative_censor
-            # Since data is sorted by abspos, we can just do binary search
-            last_valid_idx = bisect.bisect_left(abspos, censor_abspos)
-            last_valid_idx = max(
-                last_valid_idx, self.bg_events
-            )  # Always keep background
-            censored_person = {
-                key: value[:last_valid_idx] for key, value in person.items()
+    def _add_outcome_info(self, output: dict, outcome_info: List[dict]) -> Dict:
+        output.update(
+            {
+                "target": [out["target"] for out in outcome_info],
+                "person_id": [out["person_id"] for out in outcome_info],
             }
-            censored_data.append(censored_person)
-        return censored_data
-
-    def _add_outcome_info(self, batch: dict, outcome_info: List[dict]) -> Dict:
-        batch.update(
-            {key: [out[key] for out in outcome_info] for key in outcome_info[0]}
         )
-        batch["target"] = self._adjust_targets(batch["target"])
-        return batch
+        output["target"] = self._adjust_targets(output["target"])
+        return output
 
     def _adjust_targets(self, targets):
         return torch.as_tensor(targets, dtype=torch.float32)
 
+    def _censor_data(self, batch):
+        return censor_data(
+            batch["data"], batch["outcome_info"], background=self.bg_events
+        )
 
-class CausalEventCollate(CensorCollate):
-    """Collate with causal event mask and multi-trajectory targets"""
+
+class PredictCollate(Collate):
+    """Standard collate with PREDICT tokens"""
+
+    def __init__(self, *args, predict_token_id: int = 1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.predict_token_id = predict_token_id
+
+    def main(self, batch):
+        for person, outcome in zip(batch["data"], batch["outcome_info"]):
+            person["predict"] = outcome["predict"]
+        return super().main(batch)
+
+    def process_person(self, person, truncate_length: int = None):
+        """Handles all person-specific processsing"""
+        output = {}
+        truncate_length = (
+            truncate_length if truncate_length is not None else self.truncate_length
+        )
+
+        # Start with events
+        person_seq, person_event_lens, event_border = self._flatten(
+            person["event"],
+            truncate_length=truncate_length - len(person["predict"]),
+        )
+
+        # Add rest of keys
+        for key in self.data_keys:
+            if key == "segment":
+                continue
+            truncated_seq = self._truncate(person[key], event_border)
+            output[key] = truncated_seq
+
+        output["event_lens"] = person_event_lens
+        output = self.add_predict_tokens_to_person(output, person["predict"])
+        person_event_lens = output.pop("event_lens")
+
+        output["segment"] = list(range(1, len(person_event_lens) + 1))
+
+        # Expand in the end (easier grid token sort and segment creation)
+        repeats = torch.as_tensor(person_event_lens)
+        for key in output:
+            if key == "event":
+                output[key] = torch.as_tensor(sum(output[key], []), dtype=torch.int32)
+            else:
+                output[key] = self.expand(output[key], repeats)
+        return output
+
+    def add_predict_tokens_to_person(self, person, predictions):
+        """Adds a PREDICT token (self.predict_token_id used) to the person for every prediction"""
+        person = self.add_predict_features_to_person(person, predictions)
+
+        sorted_idxs = sorted(
+            range(len(person["abspos"])), key=lambda i: person["abspos"][i]
+        )
+
+        return {key: [value[i] for i in sorted_idxs] for key, value in person.items()}
+
+    def add_predict_features_to_person(self, person, predictions):
+        """Adds predict-related features to person"""
+        person["event"].extend([[self.predict_token_id] for _ in predictions])
+        person["abspos"].extend(predictions)
+        person["age"].extend(
+            [calc_age_from_abspos(person["abspos"][0], a) for a in predictions]
+        )
+        person["event_lens"].extend([1] * len(predictions))
+        return person
+
+
+class AutoregressivePredictCollate(PredictCollate, AutoregressiveCollate):
+    """Autoregressive with Predict tokens"""
+
+    pass
+
+
+class PredictCensorCollate(PredictCollate, CensorCollate):
+    """Standard collate with censoring"""
 
     def __init__(
         self,
-        truncate_length: int,
-        background_length: int,
+        *args,
         prediction_windows: list,
-        segment: bool,
-        negative_censor: int = 0,
+        padding_side: Literal["left", "right"] = "left",
+        **kwargs,
     ):
-        super().__init__(
-            truncate_length=truncate_length,
-            background_length=background_length,
-            segment=segment,
-            negative_censor=negative_censor,
-        )
+        PredictCollate.__init__(self, *args, **kwargs)
+        CensorCollate.__init__(self, *args, **kwargs)
         self.prediction_windows = torch.as_tensor(prediction_windows)
-
-    def __call__(self, batch: List[Tuple[Dict]]) -> Dict:
-        data, outcome_info = batch
-        data = self._censor(data, outcome_info)
-        # Calls Collate.__call__
-        batch = super(CensorCollate, self).__call__(data)
-
-        batch["event_lens"] = self._pad(
-            [list(itertools.accumulate(seq)) for seq in batch["event_lens"]],
-            dtype=torch.int32,
-            padding_value=10_000,  # Set to higher number than max_seq_len
-            # to_max_len=False,
-        )
-        # Create targets and add outcome_info
-        batch["target"] = self._create_targets(
-            data, outcome_info, batch["event_borders"]
-        )
-        batch = self._add_outcome_info(batch, outcome_info)
-        return batch
-
-    def _create_targets(
-        self,
-        data: Tuple[Dict],
-        outcome_info: Tuple[Dict],
-        event_borders: torch.Tensor,
-    ) -> List[Dict]:
-        """Creates targets (k=prediction window) per person abspos"""
-        targets = []
-        for person, outcome, border in zip(
-            data, outcome_info, event_borders, strict=True
-        ):
-            abspos = self._truncate(person["abspos"], border)
-            # Create targets
-            if outcome["outcome"]:
-                valid_targets = (
-                    torch.as_tensor(abspos).unsqueeze(1) + self.prediction_windows
-                ) > outcome["censor"]
-            else:
-                valid_targets = torch.zeros(len(abspos), len(self.prediction_windows))
-            targets.append(valid_targets)
-        return targets
+        self.padding_side = padding_side
 
     def _adjust_targets(self, targets):
         return self._pad(
             targets,
             dtype=torch.float32,
             padding_value=-100,
+            padding_side=self.padding_side,
         )
 
-    def _truncate(self, seq, event_border: int):
-        if event_border is None:
-            return seq
+    def _add_outcome_info(self, output: dict, outcome_info: List[dict]) -> Dict:
+        outcome_info = self._create_targets(outcome_info)
+        output["outcome"] = torch.tensor([out["outcome"] for out in outcome_info])
+        return super()._add_outcome_info(output, outcome_info)
 
-        bg, trunc_seq = seq[: self.bg_events], seq[event_border:]
-        if isinstance(seq, list):
-            return bg + trunc_seq
-        else:
-            return torch.cat((bg, trunc_seq))
+    def _create_targets(
+        self,
+        outcome_info: Tuple[Dict],
+    ) -> List[Dict]:
+        """Creates targets (k=prediction window) per predict abspos"""
+        for outcome in outcome_info:
+            predict_abspos = torch.as_tensor(sorted(outcome["predict"].tolist()))
+            target = (
+                predict_abspos.unsqueeze(-1) + self.prediction_windows
+            ) >= outcome["outcome"]
+            outcome["target"] = target
+        return outcome_info
 
 
-class ParentCausalEventCollate(CausalEventCollate):
-    # Censor
-    # Truncate
-    # Get event mask
-    # combine
+class FamilyCollate(Collate):
+    """
+    Family-aware collate that uses prediction windows for censoring.
+    feature_set (list): List of family types to include (e.g. ["Child", "Mother"])
+    """
 
-    def __call__(self, batch: Tuple[List[Dict]]) -> Dict:
-        data, outcome_info, parents = batch
-        # TODO: Move this?
-        data, targets, parents = self._censor_and_create_targets(
-            data, outcome_info, parents
-        )
+    family_type = {"Child": 1, "Father": 2, "Mother": 3}
 
-        output = {}
-        data_keys = [key for key in data[0]]
+    def __init__(self, *args, feature_set: List[str], **kwargs):
+        super().__init__(*args, **kwargs)
+        self.feature_set = feature_set
+        self.process_set = feature_set
+        self.data_keys += ["family_type"]
 
-        for add_key in data_keys + [
-            "last_data_idx",
-            "event_lens",
-            "family_type",
-            "target",
-        ]:
-            output[add_key] = []
-        if self.segment:
-            output["segment"] = []
-
-        for person, target, family in zip(data, targets, parents):
-            event_abspos = []
-            event_lens = []
-            family_seq = []
-            indv = {}
-            combined = {}
-            # First start with events to get required stuff for the others
-            person_seq, person_event_lens, event_border = self._flatten(
-                person.pop("event")
-            )
-            indv["event"] = person_seq
-            indv["family_type"] = [1] * len(person_seq)  # Person is type=1
-
-            feature_keys = [key for key in data_keys if key != "event"]
-            for key in feature_keys:
-                truncated_seq = self._truncate(person[key], event_border)
-                expanded_seq = self.expand(truncated_seq, person_event_lens)
-                indv[key] = expanded_seq
-
-            # Add only target for individual # TODO: Needed?
-            combined["target"] = self._truncate(target, event_border)
-
-            # Add rest of data
-            event_abspos.extend(self._truncate(person["abspos"], event_border))
-            event_lens.extend(person_event_lens)
+    def process_person(self, family):
+        family_seq = []
+        valid_family = [key for key in family if key in self.feature_set]
+        truncate_length = self.max_seq_len // len(valid_family) - self.background_length
+        for typ, person in family.items():
+            if typ not in self.process_set:
+                continue
+            person["family_type"] = [self.family_type[typ]] * len(person["event"])
+            if typ == "Child":
+                indv = self.process_child(person, truncate_length)
+            else:
+                indv = self.process_parent(person, truncate_length)
 
             family_seq.append(indv)
 
-            # Add parent information to family_seq
-            for parent in family:
-                typ, parent = parent.popitem()
-                parent_data = {}
-                parent_seq, parent_event_lens, parent_border = self._flatten(
-                    parent.pop("event")
-                )
-                parent_data["event"] = parent_seq
-                # Add rest of data
-                parent_data["family_type"] = [int(typ == "Mother") + 2] * len(
-                    parent_seq
-                )  # Father is type=2, Mother is type=3
-                event_abspos.extend(self._truncate(parent["abspos"], parent_border))
-                event_lens.extend(parent_event_lens)
+        combined = combine_and_sort_family_seq(family_seq)
+        return combined
 
-                for key in feature_keys:
-                    truncated_seq = self._truncate(parent[key], parent_border)
-                    expanded_seq = self.expand(truncated_seq, parent_event_lens)
-                    parent_data[key] = expanded_seq
+    def process_child(self, person, truncate_length):
+        return super().process_person(person, truncate_length)
 
-                family_seq.append(parent_data)
+    def process_parent(self, person, truncate_length):
+        return super().process_person(person, truncate_length)
 
-            # Combine members in family seqs
-            combined_abspos = [
-                abspos for person in family_seq for abspos in person["abspos"]
-            ]
-            sorted_indices = sorted(
-                range(len(combined_abspos)), key=lambda i: combined_abspos[i]
-            )
-            pre_expand_sorted_indices = sorted(
-                range(len(event_abspos)), key=lambda i: event_abspos[i]
-            )
-            for key in family_seq[0]:
-                new_seq = []
-                for person in family_seq:
-                    new_seq.extend(person[key])
-                new_seq = torch.as_tensor([new_seq[i] for i in sorted_indices])
-                combined[key] = new_seq
 
-            combined["last_data_idx"] = (combined["family_type"] == 1).nonzero()[
-                -1, 0
-            ] + 1
-            sorted_event_lens = [event_lens[i] for i in pre_expand_sorted_indices]
-            new_person_event_lens = []
-            i = 0
-            for event_len in sorted_event_lens:
-                if combined["family_type"][i] == 1:
-                    i += event_len
-                    new_person_event_lens.append(i)
-                else:
-                    i += event_len
-            combined["event_lens"] = new_person_event_lens
+class FamilyPredictCensorCollate(FamilyCollate, PredictCensorCollate):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if "Child" not in self.process_set:
+            self.process_set.append("Child")
 
-            if self.segment:
-                combined["segment"] = self.expand(
-                    list(range(1, len(event_lens) + 1)), sorted_event_lens
-                )
+    def main(self, batch):
+        for family, outcome in zip(batch["data"], batch["outcome_info"]):
+            family["Child"]["predict"] = outcome["predict"]
 
-            for key, v in combined.items():
-                output[key].append(v)
+        return super().main(batch)
 
-        # Reset max_seq_len to actual seq_len¨
-        self.max_seq_len *= 3  # TODO:
+    def add_predict_features_to_person(self, person, predictions):
+        person = super().add_predict_features_to_person(person, predictions)
+        person["family_type"].extend([person["family_type"][0]] * len(predictions))
+        return person
 
-        for key in [
-            "event",
-            "age",
-            "abspos",
-            "segment",
-            "family_type",
-        ]:
-            output[key] = self._pad(output[key])
-        output["target"] = self._adjust_targets(output["target"])
-        output["last_data_idx"] = torch.as_tensor(output["last_data_idx"])
-        output["event_lens"] = self._pad(output["event_lens"], padding_value=10_000)
+    def _censor_data(self, batch):
+        """Censors each person in data using the info in each outcome_info"""
+        censored_data = []
+        for family, outcome in zip(batch["data"], batch["outcome_info"], strict=True):
+            for typ, person in family.items():
+                family[typ] = censor_person(person, outcome, background=self.bg_events)
+            censored_data.append(family)
+        return censored_data
 
-        self.max_seq_len //= 3  # TODO:
+    def process_child(self, person, truncate_length):
+        if "Child" not in self.feature_set:
+            person = self.remove_all_but_slice_events(person, slice(None, 1))
+        indv = PredictCensorCollate.process_person(self, person, truncate_length)
+        if "Child" not in self.feature_set:
+            # Remove first event that we kept earlier
+            indv = self.remove_all_but_slice_events(indv, slice(1, None))
+        return indv
+
+    def process_parent(self, person, truncate_length):
+        return Collate.process_person(self, person, truncate_length)
+
+    def remove_all_but_slice_events(self, person, _slice):
+        """Removes information related to events based on _slice"""
+        for key, value in self.data_keys.items():
+            person[key] = value[_slice]
+        if _slice == slice(None, 1):
+            person["event"] = [[None]]  # Handle special event case
+        elif _slice == slice(1, None):  # Adjust segment
+            person["segment"] = [seg - 1 for seg in person["segment"]]
+        return person
+
+
+class FamilyPredictCensorRegressionCollate(FamilyPredictCensorCollate):
+    """
+    Family-aware collate that uses prediction windows for censoring and creates a regression target.
+    """
+
+    def _add_outcome_info(self, output: dict, outcome_info: List[dict]) -> Dict:
+        outcome_info = self._create_regression_targets(outcome_info)
+        output = super()._add_outcome_info(output, outcome_info)
+        output["target_regression"] = torch.stack(
+            [out["target_regression"] for out in outcome_info]
+        )
         return output
 
-    def _censor_and_create_targets(
-        self, data: Tuple[Dict], outcome_info: Tuple[Dict], parents: Tuple[Dict]
+    def _create_regression_targets(
+        self,
+        outcome_info: Tuple[Dict],
     ) -> List[Dict]:
-        censored_data, targets, censored_family = [], [], []
-        for person, outcome, parents in zip(data, outcome_info, parents, strict=True):
-            family = []
+        """Creates targets (k=prediction window) per predict abspos"""
+        for outcome in outcome_info:
+            target_regression = torch.as_tensor(outcome["outcome_regression"])
 
-            censor_abspos = outcome["censor"]
-            if censor_abspos is None:
-                censor_abspos = (
-                    person["abspos"][-1] - self.negative_censor
-                )  # Adjust censoring
-
-            # For the individual
-            last_valid_idx = max(
-                bisect.bisect_left(person["abspos"], censor_abspos), self.bg_events
+            outcome["target_regression"] = torch.repeat_interleave(
+                target_regression, len(outcome["predict"].tolist())
             )
-            valid_person = {
-                key: value[:last_valid_idx] for key, value in person.items()
-            }
-            # Create targets
-            if outcome["outcome"]:
-                valid_targets = (
-                    torch.tensor(valid_person["abspos"]).unsqueeze(1)
-                    + self.prediction_windows
-                ) > censor_abspos
-            else:
-                valid_targets = torch.zeros(
-                    len(valid_person["abspos"]), len(self.prediction_windows)
-                )
 
-            # For the parents
-            for typ, parent in parents.items():
-                last_valid_idx = max(
-                    bisect.bisect_left(parent["abspos"], censor_abspos), self.bg_events
-                )
-                valid_parent = {
-                    key: value[:last_valid_idx] for key, value in parent.items()
-                }
-                family.append({typ: valid_parent})
+            # # TODO: Should we just save this instead ? Could also be used to subset preds etc, right now we infer n_predict_tokens based on first batch
+            # outcome["n_predict_tokens"] = len(outcome["predict"].tolist())
+        return outcome_info
 
-            censored_data.append(valid_person)
-            targets.append(valid_targets)
-            censored_family.append(family)
 
-        return censored_data, targets, censored_family
+class FamilyAutoregressiveCollate(FamilyCollate, AutoregressiveCollate):
+    """Autoregressive with Family"""
+
+    pass

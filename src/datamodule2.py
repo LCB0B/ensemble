@@ -3,31 +3,33 @@
 import math
 import shutil
 from pathlib import Path
-from typing import Literal, List
-import torch
-import polars as pl
-import lightning as L
-import pyarrow.dataset as ds
-from torch.utils.data import DataLoader, WeightedRandomSampler, BatchSampler
-from torch.nn.attention.flex_attention import create_block_mask, and_masks
-from src.pipeline import DataPipeline
-from src.dataset import LMDBDataset, FinetuneLMDBDataset, ParentsFinetuneLMDBDataset
-from src.collate_fn2 import (
-    Collate,
-    MaskCollate,
-    CausalCollate,
-    CensorCollate,
-    CausalEventCollate,
-    ParentCausalEventCollate,
-)
-from src.utils import get_background_length, calculate_abspos, create_weights
-from src.paths import FPATH, check_and_copy_file_or_dir
-from src.utils import flex_attn_causal_event, flex_attn_padding
+from typing import List, Literal, Dict
 
-import pdb
-import os 
+import lightning as L
+import polars as pl
+import pyarrow.dataset as ds
+import torch
+from flash_attn.bert_padding import unpad_input
+from torch.utils.data import DataLoader, WeightedRandomSampler
+
+from src.collate_fn import (
+    AutoregressiveCollate,
+    AutoregressivePredictCollate,
+    Collate,
+    FamilyPredictCensorCollate,
+    FamilyPredictCensorRegressionCollate,
+    MaskCollate,
+    PredictCensorCollate,
+)
+from src.dataset import LMDBDataset, FinetuneLMDBDataset, FamilyFinetuneLMDBDataset
+from src.paths import FPATH, check_and_copy_file_or_dir
+from src.pipeline import DataPipeline
+from src.sampler import UnpadSampler
+from src.utils import calculate_abspos, create_weights, get_background_length
 
 ONE_YEAR_ABSPOS = 365.25 * 24
+
+
 
 
 # pylint: disable=arguments-differ
@@ -39,35 +41,42 @@ class BaseLightningDataModule(L.LightningDataModule):
         dir_path: Path,
         sources: List[ds.Dataset],
         background: pl.DataFrame,
-        cls_token: bool,
-        sep_token: bool,
-        segment=False,
         fill_nulls=False,
         subset_background=False,
         num_workers=0,
-        batch_size=128,
+        n_tokens=8e5,
         max_seq_len=512,
         cutoff=0,
+        source_dir=None,
+        lengths="lengths",
+        time_encoding: str = "time2vec",
+        enable_logging: bool = True,
     ):
         super().__init__()
         # Init data related stuff
         self.fill_nulls = fill_nulls
         self.sources = sources
         self.background = background
+        self.time_encoding = time_encoding
+        self.enable_logging = enable_logging
         # Init Path related stuff
         self.dir_path = dir_path
-        check_and_copy_file_or_dir(self.dir_path)
+        check_and_copy_file_or_dir(self.dir_path, verbosity=2)
+        self.source_dir = source_dir
+        self.lengths = lengths
 
         if (pipeline_path := dir_path / "pipeline.pt").exists():
             print("Loading pipeline")
             self.pipeline = torch.load(pipeline_path, weights_only=False)
         else:
             self.pipeline = DataPipeline(
-                cls_token=cls_token,
-                sep_token=sep_token,
+                cls_token=False,
+                sep_token=False,
                 fill_nulls=fill_nulls,
                 subset_background=subset_background,
                 cutoff=cutoff,
+                time_encoding=time_encoding,
+                enable_logging=enable_logging,
             )
 
         # Check and copy files between dirs
@@ -75,67 +84,110 @@ class BaseLightningDataModule(L.LightningDataModule):
 
         # Init other arg-related stuff
         self.num_workers = num_workers
-        self.batch_size = batch_size
-        self.segment = segment
+        self.n_tokens = n_tokens
 
-        # # Init length-related stuff
-        # self.background_length = (
-        #     get_background_length(background) + int(cls_token) + int(sep_token)
-        # )
-        # self.truncate_length = (
-        #     max_seq_len - self.background_length
-        # )  # TODO: Reverse, so we give max_seq_len anad calculate truncate_length in collate
-        self.cls_token = cls_token
+        # Init length-related stuff
+        self.background_length = get_background_length(background)
         self.max_seq_len = max_seq_len
 
         # Avoid lint complaints
         self.dataset = None
+        self._lengths = None
         self.train_dataset, self.val_dataset, self.predict_dataset = None, None, None
 
     def prepare_data(self):
         """Not on all workers"""
-        features_df = self.pipeline(self.sources, self.background, self.dir_path)
-        torch.save(self.pipeline, self.dir_path / "pipeline.pt")
+        if not (self.dir_path / "dataset.lmdb").exists():
+            features_df = self.pipeline(
+                self.sources, self.background, self.dir_path, self.source_dir
+            )  # ADDED self.source_dir
+            torch.save(self.pipeline, self.dir_path / "pipeline.pt")
+        else:
+            features_df = None
 
         # This reuses lmdb if exists or creates
         self.dataset = self._create_dataset(features_df, self.dir_path / "dataset.lmdb")
+        tokenized_path = self.dir_path / "tokenized.parquet"
+        if tokenized_path.is_file():
+            shutil.move(
+                tokenized_path,
+                FPATH.NETWORK_DATA / self.source_dir / f"{self.dir_path.name}.parquet",
+            )
+
+        # Define lengths for UnpadSampler
+        if self._lengths is None:
+            if isinstance(self.lengths, str) and (
+                (self.dir_path / (self.lengths + ".parquet")).exists()
+            ):
+                print(f'Info: Using unpadding lengths "{self.lengths}.parquet"')
+                self._lengths = pl.read_parquet(
+                    self.dir_path / (self.lengths + ".parquet")
+                ).cast({"person_id": pl.String})
+            else:
+                print(
+                    f"Warning: No {self.lengths}.parquet found - Using {self.max_seq_len} unpadding lengths"
+                )
+                self._lengths = [self.max_seq_len]
 
     def _create_dataset(self, dataset: ds.Dataset, path: Path):
-        return LMDBDataset(dataset, path)
+        return LMDBDataset(dataset, path, log_dir=getattr(self.pipeline, 'log_dir', None))
 
     def setup(self, stage: Literal["fit"] = None):
         """Defaults random splitting"""
-        if stage == "fit" or stage is None:
-            train, val = self.dataset.split(0.8)
-            self.train_dataset = train
-            self.val_dataset = val
-        elif stage == "predict":
-            self.predict_dataset = self.val_dataset
+        subsets = self.dataset.split({"train": 0.8, "val": 0.2})
+        self.train_dataset = subsets["train"]
+        self.val_dataset = subsets["val"]
+        self.predict_dataset = self.val_dataset
 
     def collate_fn(self):
         """Returns the Collate function for the DataModule"""
         return Collate(
-            self.truncate_length,
+            self.max_seq_len,
             self.background_length,
-            segment=self.segment,
         )
 
     def get_dataloader(self, dataset: LMDBDataset, sampler=None):
         """Returns a generic DataLoader with given attributes from self and kwargs"""
-        sampler = BatchSampler(
-            range(len(dataset)) if sampler is None else sampler,
-            batch_size=self.batch_size,
-            drop_last=False,
-        )
+        if self.num_workers == 0:
+            dataset._init_db()
         return DataLoader(
             dataset,
             batch_size=None,
             num_workers=self.num_workers,
-            persistent_workers=False,
+            persistent_workers=self.num_workers > 0,
             collate_fn=self.collate_fn(),
-            sampler=sampler,
+            sampler=self.get_sampler(dataset, sampler),
             pin_memory=True,
+            worker_init_fn=self.worker_init_fn,
         )
+
+    def get_sampler(self, dataset, sampler=None):
+        """Returns a UnpadSampler"""
+        # If lengths.parquet, subset and re-order
+        if isinstance(self._lengths, pl.DataFrame):
+            pnrs = pl.from_dict({"person_id": dataset.observations["person_id"]}).cast(
+                {"person_id": pl.String}
+            )
+            subset = pnrs.join(self._lengths, on="person_id", how="left")
+            pnr_to_length = dict(zip(subset["person_id"], subset["length"]))
+            lengths = [
+                pnr_to_length[str(pnr)] for pnr in dataset.observations["person_id"]
+            ]
+        else:
+            lengths = self._lengths * len(dataset)
+        return UnpadSampler(
+            lengths,
+            n_tokens=self.n_tokens,
+            max_seq_len=self.max_seq_len,
+            sampler=range(len(dataset)) if sampler is None else sampler,
+        )
+
+    @staticmethod
+    def worker_init_fn(worker_id):
+        """Initializes the dataset"""
+        worker_info = torch.utils.data.get_worker_info()
+        dataset = worker_info.dataset
+        dataset._init_db()
 
     def train_dataloader(self):
         """Returns the train dataloader for self.train_dataset"""
@@ -148,12 +200,6 @@ class BaseLightningDataModule(L.LightningDataModule):
     def predict_dataloader(self):
         """Returns the prediction dataloader for self.predict_dataset"""
         return self.get_dataloader(self.predict_dataset)
-
-    def get_steps_per_train_epoch(self):
-        """Returns length of dataloader (calls setup and teardown)"""
-        if self.train_dataset is None:
-            self.setup()
-        return math.ceil(len(self.train_dataset) / self.batch_size)
 
     def teardown(self, stage: str = None):
         """Copies all contents from dir_path to opposite drive if they do not exist."""
@@ -174,275 +220,216 @@ class BaseLightningDataModule(L.LightningDataModule):
             if torch.is_tensor(v):
                 batch[key] = v.to(device, non_blocking=True)
         return batch
-    
-    
-    
-    def on_after_batch_transfer(self, batch, dataloader_idx):
-        bs, seq_len = batch["event"].shape
 
+    def on_after_batch_transfer(self, batch,dataloader_idx):
+        # TODO: Should be part of collate_fn!
+        batch["attn_mask"] = batch["event"] != 0
 
-        def causal_mask(b,h,q_idx,kv_idx):
-            return q_idx >= kv_idx
-
-        if __debug__:
-            pdb.set_trace()
-        # Create block mask
-        batch["attn_mask"] = create_block_mask(
-            and_masks(
-                causal_mask,
-                flex_attn_padding(batch["sequence_lens"]),
-            ),
-            bs,
-            None,
-            seq_len,
-            seq_len,
-            _compile=True)
+        batch = self.unpad(batch)
 
         return batch
 
+    def unpad(self, batch):
+        # Unpad inputs
+        _, indices, cu_seqlens, max_seqlen_in_batch, total = unpad_input(
+            batch["event"].unsqueeze(-1), batch["attn_mask"]
+        )
+        batch["indices"] = indices
+        batch["max_seqlen_in_batch"] = max_seqlen_in_batch
+        batch["cu_seqlens"] = cu_seqlens
+        batch["total"] = total.sum().item()
 
-class PretrainLifeLightningDataModule(BaseLightningDataModule):
+        # Flatten inputs
+        batch["event"] = batch["event"].flatten()[batch["indices"]]
+
+        # Only flatten abspos and age if using time2vec encoding
+        if self.time_encoding == "time2vec":
+            batch["abspos"] = batch["abspos"].flatten()[batch["indices"]]
+            batch["age"] = batch["age"].flatten()[batch["indices"]]
+
+        batch["segment"] = batch["segment"].flatten()[batch["indices"]]
+        return batch
+
+
+
+
+class PretrainDataModule(BaseLightningDataModule):
     """Lightning Data Module for MLM pretraining"""
 
+    def __init__(self, *args, pretrain_style: str, masking_ratio=0.15, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pretrain_style = pretrain_style.upper()
+        self.masking_ratio = masking_ratio
+
+    def on_after_batch_transfer(self, batch, dataloader_idx):
+        batch = super().on_after_batch_transfer(batch, dataloader_idx)
+        batch["target"] = batch["target"].flatten()[batch["indices"]]
+
+        return batch
+
     def collate_fn(self):
-        return MaskCollate(
-            vocab=self.pipeline.vocab,
-            truncate_length=self.truncate_length,
-            background_length=self.background_length,
-            segment=self.segment,
-        )
-
-class LifeLightningDataModule(BaseLightningDataModule):
-    """Lightning Data Module for Causal pretraining"""
-
-    def collate_fn(self):
-        return CausalCollate(
-            vocab=self.pipeline.vocab,
-            truncate_length=self.truncate_length,
-            background_length=self.background_length,
-            segment=self.segment,
-        )
+        if self.pretrain_style == "MLM":
+            return MaskCollate(
+                vocab=self.pipeline.vocab,
+                max_seq_len=self.max_seq_len,
+                background_length=self.background_length,
+                mask_prob=self.masking_ratio,
+            )
+        elif self.pretrain_style == "AR":
+            return AutoregressiveCollate(
+                max_seq_len=self.max_seq_len,
+                background_length=self.background_length,
+            )
+        raise ValueError(self.pretrain_style)
 
 
-    
-    # def on_after_batch_transfer(self, batch, dataloader_idx):
-    #     bs, seq_len = batch["event"].shape
-    #     range_tensor = torch.arange(seq_len, device=batch["event"].device)
-
-    #     if __debug__:
-    #         pdb.set_trace()
-        
-    #     batch["event_mask"] = self.create_event_mask(batch,range_tensor)
-
-    #     range_tensor_exp = range_tensor.expand(
-    #         batch["acc_event_lens"].size(0), -1
-    #     ).contiguous()
-    #     # Create mapping
-    #     causal_mapping = torch.searchsorted(
-    #         batch["acc_event_lens"], range_tensor_exp, right=True
-    #     )
-
-    #     # Create block mask
-    #     batch["attn_mask"] = create_block_mask(
-    #         and_masks(
-    #             flex_attn_causal_event(causal_mapping),
-    #             flex_attn_padding(batch["sequence_lens"]),
-    #         ),
-    #         bs,
-    #         None,
-    #         seq_len,
-    #         seq_len,
-    #         _compile=True,
-    #     )
-    #     return batch
-
-    # def create_event_mask(self, batch,range_tensor):
-    #     """Creates the event mask based on the prediction type (grid or per event)"""
-    #     # num_buckets = batch["target"].size(1)
-    #     # grid = batch["first_abspos"].unsqueeze(1) + torch.arange(
-    #     #     0,
-    #     #     ONE_YEAR_ABSPOS * (num_buckets // 2),
-    #     #     ONE_YEAR_ABSPOS // 2,
-    #     #     device=batch["abspos"].device,
-    #     # )
-    #     # return (batch["abspos"].unsqueeze(1) <= grid.unsqueeze(-1)).half()
-    #     return (
-    #         (range_tensor < batch["acc_event_lens"].unsqueeze(-1))
-    #         & (range_tensor < batch["sequence_lens"].unsqueeze(-1)).unsqueeze(1)
-    #     ).half()
-
-
-
-class FinetuneLifeLightningDataModule(BaseLightningDataModule):
-    """Lightning Data Module for binary finetuning"""
+class PretrainPredictDataModule(PretrainDataModule):
+    """Lightning Data Module for PREDICT token pretraining"""
 
     def __init__(
         self,
         *args,
         outcomes: pl.DataFrame,
-        negative_censor: float,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.outcomes = outcomes
-        self.negative_censor = negative_censor
-
-    def _create_dataset(self, dataset: ds.Dataset, path: Path):
-        outcomes_dict = self.outcomes.with_columns(
-            calculate_abspos(pl.col("censor"))
-        ).to_dict(as_series=False)
-        return FinetuneLMDBDataset(dataset, path, outcomes_dict)
 
     def collate_fn(self):
-        return CensorCollate(
-            truncate_length=self.truncate_length,
+        return AutoregressivePredictCollate(
+            max_seq_len=self.max_seq_len,
             background_length=self.background_length,
-            segment=self.segment,
-            negative_censor=ONE_YEAR_ABSPOS * self.negative_censor,
+            # predict_token_id=1, # DEFAULTED
         )
+
+    def _create_dataset(self, dataset: ds.Dataset, path: Path):
+        outcomes_dict = (
+            self.outcomes.with_columns(
+                calculate_abspos(pl.col("censor")),
+                calculate_abspos(pl.col("outcome")),
+                pl.col("predict").list.eval(calculate_abspos(pl.element())),
+            )
+            .to_pandas()
+            .to_dict(orient="list")
+        )
+        return FinetuneLMDBDataset(dataset, path, outcomes_dict, log_dir=getattr(self.pipeline, 'log_dir', None))
+
+
+class PredictFinetuneLifeLDM(BaseLightningDataModule):
+    def __init__(
+        self,
+        *args,
+        outcomes: Dict[str, pl.DataFrame],
+        prediction_windows: List[float],
+        padding_side: Literal["left", "right"] = "left",
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.outcomes = outcomes
+        self.prediction_windows = prediction_windows
+        self.padding_side = padding_side
+        self.collate = None
+
+        for key, df in self.outcomes.items():
+            self.outcomes[key] = self.prep_outcomes(df)
+
+    def setup(self, stage: Literal["fit"] = None):
+        """Defaults random splitting"""
+        if len(self.outcomes) == 1:  # Only a train split
+            subsets = self.dataset.split({"train": 0.8, "val": 0.2})
+            self.train_dataset = subsets["train"]
+            self.val_dataset = subsets["val"]
+            self.predict_dataset = self.val_dataset
+        else:
+            self.train_dataset = self.dataset
+            self.val_dataset = self.dataset.subset(self.outcomes["val"])
+            if "test" in self.outcomes:
+                self.predict_dataset = self.dataset.subset(self.outcomes["test"])
+
+    def prep_outcomes(self, df):
+        return (
+            df.with_columns(
+                calculate_abspos(pl.col("censor")),
+                calculate_abspos(pl.col("outcome")),
+                pl.col("predict").list.eval(calculate_abspos(pl.element())),
+            )
+            .to_pandas()
+            .to_dict(orient="list")
+        )
+
+    def _create_dataset(self, dataset: ds.Dataset, path: Path):
+        return FinetuneLMDBDataset(dataset, path, self.outcomes["train"], log_dir=getattr(self.pipeline, 'log_dir', None))
 
     def train_dataloader(self):
         train_outcomes = self.train_dataset.observations["outcome"]
+        train_outcomes = [1 - math.isnan(out) for out in train_outcomes]
         weights = create_weights(train_outcomes, op=math.sqrt)
         sampler = WeightedRandomSampler(
             weights, num_samples=len(train_outcomes), replacement=True
         )
         return self.get_dataloader(self.train_dataset, sampler=sampler)
 
+    def collate_fn(self):
+        self.collate = PredictCensorCollate(
+            max_seq_len=self.max_seq_len,
+            background_length=self.background_length,
+            prediction_windows=[
+                ONE_YEAR_ABSPOS * window for window in self.prediction_windows
+            ],
+            padding_side=self.padding_side,
+        )
+        return self.collate
+
     def on_after_batch_transfer(self, batch, dataloader_idx):
+        batch["predict_tokens"] = batch["event"] == self.collate.predict_token_id
+        batch["og_abspos"] = batch["abspos"]  # TODO: Not ideal
+        batch["og_age"] = batch["age"].round(decimals=2)  # TODO: Not ideal
         batch = super().on_after_batch_transfer(batch, dataloader_idx)
+
         return batch
 
 
-class RiskFinetuneLifeLightningDataModule(FinetuneLifeLightningDataModule):
-    """Lightning Data Module for risk trajectories finetuning"""
-
-    def __init__(
-        self,
-        *args,
-        prediction_windows: List[float],
-        **kwargs,
-    ):
+class FamilyPredictFinetuneLifeLDM(PredictFinetuneLifeLDM):
+    def __init__(self, *args, feature_set: List[str], **kwargs):
         super().__init__(*args, **kwargs)
-        self.prediction_windows = prediction_windows
+        self.feature_set = feature_set
 
-    def get_dataloader(self, dataset: LMDBDataset, sampler=None):
-        """Returns a generic DataLoader with given attributes from self and kwargs"""
-        self.max_abspos = dataset.get_max_abspos()
-        return super().get_dataloader(dataset, sampler)
+    def _create_dataset(
+        self,
+        dataset: ds.Dataset,
+        path: Path,
+    ):
+        outcomes_dict = (
+            self.outcomes.with_columns(
+                calculate_abspos(pl.col("censor")),
+                calculate_abspos(pl.col("outcome")),
+                pl.col("predict").list.eval(calculate_abspos(pl.element())),
+            )
+            .to_pandas()
+            .to_dict(orient="list")
+        )
+        return FamilyFinetuneLMDBDataset(dataset, path, outcomes_dict, log_dir=getattr(self.pipeline, 'log_dir', None))
 
     def collate_fn(self):
-        return CausalEventCollate(
-            truncate_length=self.truncate_length,
+        self.collate = FamilyPredictCensorCollate(
+            max_seq_len=self.max_seq_len,
             background_length=self.background_length,
             prediction_windows=[
                 ONE_YEAR_ABSPOS * window for window in self.prediction_windows
             ],
-            negative_censor=ONE_YEAR_ABSPOS * self.negative_censor,
-            segment=self.segment,
-            max_abspos=self.max_abspos,
+            feature_set=self.feature_set,
         )
-
-    def on_after_batch_transfer(self, batch, dataloader_idx):
-        bs, seq_len = batch["event"].shape
-        range_tensor = torch.arange(seq_len, device=batch["event"].device)
-
-        batch["event_mask"] = self.create_event_mask(batch)
-
-        range_tensor_exp = range_tensor.expand(
-            batch["acc_event_lens"].size(0), -1
-        ).contiguous()
-        # Create mapping
-        causal_mapping = torch.searchsorted(
-            batch["acc_event_lens"], range_tensor_exp, right=True
-        )
-
-        # Create block mask
-        batch["attn_mask"] = create_block_mask(
-            and_masks(
-                flex_attn_causal_event(causal_mapping),
-                flex_attn_padding(batch["sequence_lens"]),
-            ),
-            bs,
-            None,
-            seq_len,
-            seq_len,
-            _compile=True,
-        )
-        return batch
-
-    def create_event_mask(self, batch):
-        """Creates the event mask based on the prediction type (grid or per event)"""
-        num_buckets = batch["target"].size(1)
-        grid = batch["first_abspos"].unsqueeze(1) + torch.arange(
-            0,
-            ONE_YEAR_ABSPOS * (num_buckets // 2),
-            ONE_YEAR_ABSPOS // 2,
-            device=batch["abspos"].device,
-        )
-        return (batch["abspos"].unsqueeze(1) <= grid.unsqueeze(-1)).half()
-        # return (
-        #     (range_tensor < batch["acc_event_lens"].unsqueeze(-1))
-        #     & (range_tensor < batch["sequence_lens"].unsqueeze(-1)).unsqueeze(1)
-        # ).half()
+        return self.collate
 
 
-class ParentsFinetuneLifeLightningDataModule(FinetuneLifeLightningDataModule):
-    """Lightning Data Module for parent risk trajectories finetuning"""
-
-    def __init__(
-        self,
-        *args,
-        parents: pl.DataFrame,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self.outcomes = self.outcomes.join(parents, on="person_id", how="left")
-
-    def _create_dataset(self, dataset: ds.Dataset, path: Path):
-        outcomes_dict = self.outcomes.with_columns(
-            calculate_abspos(pl.col("censor"))
-        ).to_dict(as_series=False)
-        return ParentsFinetuneLMDBDataset(dataset, path, outcomes_dict)
-
+class FamilyRegressionFinetuneLifeLDM(FamilyPredictFinetuneLifeLDM):
     def collate_fn(self):
-        return ParentCausalEventCollate(
-            truncate_length=self.truncate_length,
+        self.collate = FamilyPredictCensorRegressionCollate(
+            max_seq_len=self.max_seq_len,
             background_length=self.background_length,
             prediction_windows=[
                 ONE_YEAR_ABSPOS * window for window in self.prediction_windows
             ],
-            negative_censor=ONE_YEAR_ABSPOS * self.negative_censor,
-            segment=self.segment,
-            max_abspos=self.max_abspos,
+            feature_set=self.feature_set,
         )
-
-
-class ParentsRiskFinetuneLifeLightningDataModule(RiskFinetuneLifeLightningDataModule):
-    """Lightning Data Module for parent risk trajectories finetuning"""
-
-    def __init__(
-        self,
-        *args,
-        parents: pl.DataFrame,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self.outcomes = self.outcomes.join(parents, on="person_id", how="left")
-
-    def _create_dataset(self, dataset: ds.Dataset, path: Path):
-        outcomes_dict = self.outcomes.with_columns(
-            calculate_abspos(pl.col("censor"))
-        ).to_dict(as_series=False)
-        return ParentsFinetuneLMDBDataset(dataset, path, outcomes_dict)
-
-    def collate_fn(self):
-        return ParentCausalEventCollate(
-            truncate_length=self.truncate_length,
-            background_length=self.background_length,
-            prediction_windows=[
-                ONE_YEAR_ABSPOS * window for window in self.prediction_windows
-            ],
-            negative_censor=ONE_YEAR_ABSPOS * self.negative_censor,
-            segment=self.segment,
-        )
+        return self.collate

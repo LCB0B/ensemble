@@ -1,23 +1,42 @@
+import hydra
+import joblib
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score
 from catboost import CatBoostClassifier
-import joblib
-from src.paths import FPATH, copy_file_or_dir
+from omegaconf import DictConfig
+from sklearn.metrics import roc_auc_score
 
-if __name__ == "__main__":
-    
-    data_split = "val" # test or val
-    experiment = "CB2"
-    print(f"Doing inference for experiment {experiment} datasplit {data_split}")
+from src.earlylife.src.paths import FPATH
+
+
+@hydra.main(
+    config_path=(FPATH.CONFIGS / "tabular").as_posix(),
+    config_name="catboost_inference.yaml",
+    version_base=None,
+)
+def main(hparams: DictConfig) -> None:
+    data_split = hparams.data_split  # test or val
+    experiment_name = hparams.experiment_name
+    study_name = f"{experiment_name}_{hparams.outcome}"
+
+    subset_size = hparams.subset_size
+    if subset_size is not None:
+        study_name += f"_{subset_size}"
+        experiment_name += f"_{subset_size}"
+
+    study_file = FPATH.OPTUNA / "cb" / f"cb_optuna_study_{study_name}.pkl"
+
+    print(f"Doing inference for experiment {study_name}, datasplit: {data_split}")
     print("Loading data")
-    input_data_path = FPATH.DATA / f"{data_split}_dense.parquet"
-    outcome_data_path = FPATH.DATA / f"{data_split}_y.npy"
 
-    copy_file_or_dir(input_data_path)
-    copy_file_or_dir(outcome_data_path)
+    input_data_path = (
+        FPATH.DATA
+        / hparams.data_folder
+        / f"{hparams.outcome}_{data_split}_dense.parquet"
+    )
 
-    study = joblib.load(FPATH.OPTUNA / f"{experiment}_optuna_study.pkl")
+    # Load Optuna study and best model path
+    study = joblib.load(study_file)
     best_model_path = study.best_trial.user_attrs["best_model_path"]
 
     # Load the best CatBoost model
@@ -25,17 +44,31 @@ if __name__ == "__main__":
     model.load_model(best_model_path)
 
     # Load test data for inference
-    data = pd.read_parquet(input_data_path)
+    data = pd.read_parquet(FPATH.swap_drives(input_data_path))
 
     # Run inference
     predictions = model.predict_proba(data)[:, 1]
 
     # Save the predictions
-    output_file_path = FPATH.DATA / f"cb_preds_{experiment}_{data_split}.npy"
-    np.save(output_file_path, predictions)
-    FPATH.alternative_copy_to_opposite_drive(output_file_path)
+    output_folder = FPATH.DATA / hparams.output_folder
+    output_folder.mkdir(exist_ok=True)
+    output_file = output_folder / f"cb_preds_{study_name}_{data_split}.npy"
+
+    np.save(output_file, predictions)
+    FPATH.alternative_copy_to_opposite_drive(output_file)
 
     # Evaluate the model
-    y_test = np.load(outcome_data_path)
-    auc_score = roc_auc_score(y_test, predictions)
-    print(f"ROC AUC Score: {auc_score:.4f}")
+
+    outcome_data_path = (
+        FPATH.DATA / hparams.data_folder / f"{hparams.outcome}_{data_split}_y.npy"
+    )
+    y_true = np.load(FPATH.swap_drives(outcome_data_path))
+    try:
+        auc_score = roc_auc_score(y_true, predictions)
+        print(f"ROC AUC Score: {auc_score:.4f}")
+    except ValueError:
+        pass
+
+
+if __name__ == "__main__":
+    main()

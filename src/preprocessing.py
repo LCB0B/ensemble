@@ -1,14 +1,35 @@
-import polars as pl
-from pathlib import Path
-from src.utils import filter_parquet_by_person_ids_to_dataset
-from src.paths import FPATH, check_and_copy_file, copy_file_or_dir
-from src.chunking import write_dataset_to_parquet_in_batches
-from typing import Tuple, List, Optional
-from tqdm import tqdm
-import pyarrow.parquet as pq
-import pyarrow.dataset as ds
-import pyarrow.compute as pc
 import math
+from pathlib import Path
+from typing import Any, List, Optional, Tuple
+
+import polars as pl
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+from tqdm import tqdm
+
+from src.chunking import write_dataset_to_parquet_in_batches
+from src.paths import FPATH, check_and_copy_file, copy_file_or_dir
+from src.utils import filter_parquet_by_person_ids_to_dataset
+
+
+def unique_preserve_order(lst: List[Any]) -> List[Any]:
+    """
+    Return unique elements in a list while preserving their original order.
+
+    Args:
+        lst (List[Any]): A list of elements.
+
+    Returns:
+        List[Any]: A list of unique elements in the order they appear.
+    """
+    seen = set()
+    unique_lst = []
+    for item in lst:
+        if item not in seen:
+            seen.add(item)
+            unique_lst.append(item)
+    return unique_lst
 
 
 def bin_column(col_name: str, dataset: ds.Dataset, bins: int) -> Path:
@@ -18,7 +39,7 @@ def bin_column(col_name: str, dataset: ds.Dataset, bins: int) -> Path:
 
     Args:
         col_name (str): The name of the column to bin.
-        dataset (pl.DataFrame): The input dataset containing the column.
+        dataset (ds.Dataset): The input dataset containing the column.
         bins (int): The number of bins to create. Defaults to 100.
 
     Returns:
@@ -28,7 +49,7 @@ def bin_column(col_name: str, dataset: ds.Dataset, bins: int) -> Path:
     col = pl.from_arrow(dataset.to_table(columns=[col_name]))
 
     # Generate cutoff points for binning
-    cutoffs: List[float] = [i / bins for i in range(1, bins)]
+    cutoffs = [i / bins for i in range(1, bins)]
 
     print(f"{col_name}: Counting unique values...")
     # Count unique values
@@ -48,6 +69,59 @@ def bin_column(col_name: str, dataset: ds.Dataset, bins: int) -> Path:
     # Write the binned column to a parquet file
     print(f"{col_name}: Binning...")
     col.select(binned_col).write_parquet(output_path)
+
+    return output_path
+
+
+def bin_column_grouped_by(
+    col_name: str, group_col: str, dataset: ds.Dataset, bins: int
+) -> Path:
+    """
+    Bins the values of a specified column into quantiles within each group, preserving the original row order,
+    writes the binned result to a parquet file, and returns the file path.
+
+    Args:
+        col_name (str): The name of the column to bin.
+        group_col (str): The column name to group by.
+        dataset (ds.Dataset): The input dataset containing the columns.
+        bins (int): The number of bins to create.
+
+    Returns:
+        Path: The path to the saved parquet file.
+    """
+    # Read required columns from dataset and convert to Polars DataFrame
+    table = dataset.to_table(columns=[col_name, group_col])
+    df = pl.from_arrow(table)
+
+    # Add an index to preserve original row order
+    df = df.with_row_index("order")
+
+    # Define cutoff points and labels
+    cutoffs = [i / bins for i in range(1, bins)]
+    labels = [f"{col_name}_Q{i}" for i in range(1, bins + 1)]
+
+    # Compute rank and unique count per group, then calculate bin ratio and apply cut.
+    df = df.with_columns(pl.col(group_col).dt.year().alias("group_col"))
+    df = df.with_columns(
+        [
+            pl.col(col_name).rank(method="dense").over("group_col").alias("rank"),
+            pl.col(col_name).n_unique().over("group_col").alias("n_unique"),
+        ]
+    ).with_columns(
+        (
+            (pl.col("rank") / pl.col("n_unique"))
+            .cut(cutoffs, labels=labels)
+            .cast(pl.Utf8)
+        ).alias(f"binned_grouped_{col_name}")
+    )
+
+    # Restore original order and select only the binned column
+    df = df.sort("order")
+    result_df = df.select(f"binned_grouped_{col_name}")
+
+    # Define the output path using a temporary directory
+    output_path = FPATH.TEMP_FILES / f"binned_grouped_{col_name}.parquet"
+    result_df.write_parquet(output_path)
 
     return output_path
 
@@ -111,15 +185,42 @@ def prefix_col_name_keep_nulls(df: pl.DataFrame, cols: list[str]) -> pl.DataFram
     return df
 
 
+def prefix_value_keep_nulls(
+    df: pl.DataFrame, cols_value_list: list[(str, str)]
+) -> pl.DataFrame:
+    """
+    Iterate through specified columns in a DataFrame and prefix non-null values
+    with the given value name. Null values are left unchanged.
+
+    Args:
+        df (pl.DataFrame): The input DataFrame.
+        cols (: list[(str, str)]): List of tuples with column names and values.
+
+    Returns:
+        pl.DataFrame: The modified DataFrame with prefixed non-null values.
+    """
+    for col, value in cols_value_list:
+        df = df.with_columns(
+            pl.when(pl.col(col).is_not_null())
+            .then(pl.lit(f"{value}_") + pl.col(col).cast(pl.Utf8))
+            .otherwise(pl.col(col))  # Keep null as null
+            .alias(col)
+        )
+    return df
+
+
 def concat_datasets(
     datasets: List[ds.Dataset],
     output_file_path: Path,
     truncation_specs: List[Tuple[str, int]],
-    cols_prefix: List[str],
-    cols_binned: List[str],
+    cols_to_prefix_colname: List[str],
+    cols_to_prefix_value: List[Tuple[str, str]],
+    cols_overall_binned: List[str],
+    cols_yearly_binned: List[str],
     cols_unchanged: List[str],
     date_col: str,
-    chunk_size: int = 1_000_000,
+    chunk_size: int = 200_000_000,
+    overall_group_name: Optional[str] = None,
 ) -> None:
     """
     Reads chunks from multiple Parquet files using dataset.take in chunks, applies truncation and prefixing only on the first chunk of the
@@ -130,11 +231,13 @@ def concat_datasets(
         datasets (ds.Dataset): List of Datasets to process and concat.
         output_file_path (Path): Path to the output Parquet file.
         truncation_specs (List[Tuple[str, int]]): Columns to truncate and their respective lengths.
-        cols_prefix (List[str]): Columns to prefix non-null values.
+        cols_to_prefix_colname (List[str]): Columns to prefix non-null values with column name.
+        cols_to_prefix_value (List[Tuple[str, str]): Columns to prefix non-null values with value.
         cols_binned (List[str]): Columns to be binned and kept in the output.
         cols_unchanged (List[str]): Columns to keep unchanged in the output.
         date_col (str): Column to be renamed to 'date_col'.
-        chunk_size (int): Number of rows to read per chunk. Default 100,000.
+        chunk_size (int): Number of rows to read per chunk. Default 100,000,000.
+        overall_group_name (Optional(str)): Overall group name to prefix onto all values.
     """
     individual_total_rows = [dataset.count_rows() for dataset in datasets]
     total_rows = individual_total_rows[0]
@@ -145,31 +248,51 @@ def concat_datasets(
     indices = list(range(0, total_rows, chunk_size))
 
     # Create a list of binned column names
-    binned_cols_names = [f"binned_{bin_specs[0]}" for bin_specs in cols_binned]
+    binned_cols_names = [f"binned_{bin_name}" for bin_name in cols_overall_binned] + [
+        f"binned_grouped_{bin_name}" for bin_name in cols_yearly_binned
+    ]
 
-    # Define the columns to keep, excluding unbinned columns that match a binned column
-    _cols_to_keep = (
-        ["person_id", "date_col"] + cols_prefix + binned_cols_names + cols_unchanged
+    cols_which_were_binned = cols_overall_binned + cols_yearly_binned
+
+    # Define the columns to keep
+    _cols_to_keep = unique_preserve_order(
+        ["person_id", "date_col"]
+        + cols_to_prefix_colname
+        + [col_val_tuple[0] for col_val_tuple in cols_to_prefix_value]
+        + binned_cols_names
+        + cols_unchanged
     )
-    cols_which_were_binned = [bin_specs[0] for bin_specs in cols_binned]
+
+    # Remove column which have been binned
     cols_to_keep = [col for col in _cols_to_keep if col not in cols_which_were_binned]
 
-    # while True:
-    #     chunks = []
     writer = None
-    for start_idx in tqdm(indices, "Concatenating datasets"):
+    for start_idx in tqdm(indices, "Writing to file"):
         chunks = []
         for i, dataset in enumerate(datasets):
             end_idx = min(start_idx + chunk_size, total_rows)
             chunk = dataset.take(indices=list(range(start_idx, end_idx)))
             chunk = pl.from_arrow(chunk)
 
+            # First dataset is full dataset, remaining are binned columns
             if i == 0:
                 if truncation_specs:
                     chunk = truncate_columns(chunk, truncation_specs)
-                if cols_prefix:
-                    chunk = prefix_col_name_keep_nulls(chunk, cols_prefix)
+                if cols_to_prefix_colname:
+                    chunk = prefix_col_name_keep_nulls(chunk, cols_to_prefix_colname)
+                if cols_to_prefix_value:
+                    chunk = prefix_value_keep_nulls(chunk, cols_to_prefix_value)
+
                 chunk = chunk.rename({date_col: "date_col"})
+
+            # Prefix all values with possible overall group name
+            if overall_group_name:
+                overall_group_name_list = [
+                    (col, overall_group_name)
+                    for col in chunk.columns
+                    if col not in ("person_id", "date_col")
+                ]
+                chunk = prefix_value_keep_nulls(chunk, overall_group_name_list)
 
             chunks.append(chunk)
 
@@ -203,7 +326,7 @@ def write_person_id_birthday_filtered_dataset(
     person_df: pl.DataFrame,
     output_path: Path,
     date_col: str,
-    batch_size: int = 10_000_000,
+    batch_size: int = 100_000_000,
 ) -> ds.Dataset:
     """
     Writes a PyArrow Dataset to Parquet in batches after merging with a Polars dataframe
@@ -223,13 +346,14 @@ def write_person_id_birthday_filtered_dataset(
     person_table = person_df.to_arrow()
     input_dataset = ds.dataset(file_path, format="parquet")
 
+    n_rows = input_dataset.count_rows()
+    n_batches = math.ceil(n_rows / batch_size)
+    output_path.parent.mkdir(exist_ok=True)
     # Step 2: Prepare the Parquet writer
     with pq.ParquetWriter(output_path, input_dataset.schema) as writer:
 
         # Step 3: Process the dataset in batches (done using take to avoid small batches)
-        n_rows = input_dataset.count_rows()
-        n_batches = math.ceil(n_rows / batch_size)
-        for i in tqdm(range(0, n_batches), "Filtering batches"):
+        for i in tqdm(range(0, n_batches), "Filtering to exclude previous events"):
 
             lowest_idx = i * batch_size
             highest_idx = (i + 1) * batch_size
@@ -239,21 +363,21 @@ def write_person_id_birthday_filtered_dataset(
             batch_table = input_dataset.take(indices=range(lowest_idx, highest_idx))
 
             # Step 4: Perform an in-memory join of the current batch with the birthdays (person_table)
-            merged_table = batch_table.join(
+            batch_table = batch_table.join(
                 person_table, keys="person_id", join_type="inner"
             )
 
             # Step 5: Apply the date filter (where date_col >= birthday)
-            filtered_table = merged_table.filter(
-                pc.greater_equal(merged_table[date_col], merged_table["_birthday"])
+            batch_table = batch_table.filter(
+                pc.greater_equal(batch_table[date_col], batch_table["_birthday"])
             )
 
             # Step 6: Ensure the table schema matches the original schema by selecting the original columns
-            filtered_table = filtered_table.select(input_dataset.schema.names)
+            batch_table = batch_table.select(input_dataset.schema.names)
 
             # Step 7: Write the filtered table in batches
-            if len(filtered_table) > 0:
-                writer.write_table(filtered_table)
+            if len(batch_table) > 0:
+                writer.write_table(batch_table)
 
     # Return the new dataset pointing to the output path
     return ds.dataset(output_path, format="parquet")
@@ -263,33 +387,48 @@ def process_dataset(
     dump_path: Path,
     person_subsample: List[int],
     truncation_specs: List[Tuple[str, int]],
-    cols_to_prefix: List[str],
-    binning_specs: List[Tuple[str, int]],
+    cols_to_prefix_colname: List[str],
+    cols_to_prefix_value: List[Tuple[str, str]],
+    overall_binning_specs: List[Tuple[str, int]],
+    yearly_binning_specs: List[Tuple[str, str, int]],
     cols_unchanged: List[str],
     date_col_name: str,
     output_file_path: Path,
     df_remove_pre_date_events: Optional[pl.DataFrame] = None,
+    overall_group_name: Optional[str] = None,
+    chunk_size: Optional[int] = 200_000_000,
 ) -> None:
     """
     Processes the dataset by filtering, binning, and concatenating datasets.
 
     Args:
-        dump_path (Path): Path to the original dataset dump.
+        dump_path (Path): (Path) Path to the original dataset dump.
         person_subsample (List[int]): List of person IDs to filter.
-        fname_prefix (str): Prefix for the output filenames.
-        fname (str): Base name for the output file.
-        truncation_specs (List[Tuple[str, int]]): Specifications for truncating columns.
-        cols_to_prefix (List[str]): Columns to prefix.
-        binning_specs (List[Tuple[str, int]]): Columns and bin sizes.
+        truncation_specs (List[Tuple[str, int]]):  Specifications for truncating columns.
+        cols_to_prefix_colname (List[str]):  Columns to prefix with their name.
+        cols_to_prefix_value (List[Tuple[str, str]]): Columns to prefix with a fixed value.
+        binning_specs (List[Tuple[str, int]]): Columns and the bin amount.
+        binning_group_by (List[Tuple[str, str, int]]): List of tuples with (column_to_bin, n_bins, grouping_col). Grouping_col should be the date col, as it extracts the year from this
         cols_unchanged (List[str]): Columns to leave unchanged.
-        date_col_name (str): Name of the date column.
-        output_file_path (Path): Output file path.
-        df_remove_pre_date_events (Optional[pl.DataFrame]): Dataframe with person_id and cutoff column _birthday
+        date_col_name (str):  Name of the date column.
+        output_file_path (Path): Path for the final output file.
+        df_remove_pre_date_events (Optional[pl.DataFrame]): DataFrame used for filtering.
+        overall_group_name (Optional[str]): Overall group name to prefix onto all values.
+        chunk_size (Optional[int]): Chunk size when processing data in memory.
     """
-    copy_file_or_dir(dump_path)
+    check_and_copy_file(dump_path)
     # Step 1: Filter
     # NOTE: Faster to filter and dump once, rather than filter in each downstream operation (including each chunk in concat_datasets)
     if df_remove_pre_date_events is not None:
+        pre_date_events_pnrs = set(
+            df_remove_pre_date_events.select("person_id").unique().to_series().to_list()
+        )
+        assert pre_date_events_pnrs >= set(
+            person_subsample
+        ), "pre_date_events is not a superset of person_subsample, so person_subsample is not your actual sample"
+        df_remove_pre_date_events = df_remove_pre_date_events.filter(
+            pl.col("person_id").is_in(person_subsample)
+        )
         filtered_dataset = write_person_id_birthday_filtered_dataset(
             dump_path,
             df_remove_pre_date_events,
@@ -304,12 +443,18 @@ def process_dataset(
             _filtered_dataset, FPATH.TEMP_FILES / "process_dataset.parquet"
         )
 
-    # Step 2: Bin the 'wage' and 'length' columns and get their paths
+    # Step 2: Bin columns and get their paths
     binned_paths = []
-    for col, n_bins in binning_specs:
+    binned_overall_cols = []
+    binned_yearly_cols = []
+    for col, n_bins, group_col in yearly_binning_specs:
+        binned_path = bin_column_grouped_by(col, group_col, filtered_dataset, n_bins)
+        binned_paths.append(binned_path)
+        binned_yearly_cols.append(col)
+    for col, n_bins in overall_binning_specs:
         binned_path = bin_column(col, filtered_dataset, n_bins)
         binned_paths.append(binned_path)
-
+        binned_overall_cols.append(col)
     # Step 3: Concat datasets
     # # Step 3 also does other processing
     datasets = [filtered_dataset] + [
@@ -320,10 +465,14 @@ def process_dataset(
         datasets,
         output_file_path=output_file_path,
         truncation_specs=truncation_specs,
-        cols_prefix=cols_to_prefix,
-        cols_binned=binning_specs,
+        cols_to_prefix_colname=cols_to_prefix_colname,
+        cols_to_prefix_value=cols_to_prefix_value,
+        cols_yearly_binned=binned_yearly_cols,
+        cols_overall_binned=binned_overall_cols,
         date_col=date_col_name,
         cols_unchanged=cols_unchanged,
+        chunk_size=chunk_size,
+        overall_group_name=overall_group_name,
     )
 
 
@@ -338,21 +487,36 @@ def extract_specs(columns: dict):
         tuple: A tuple containing truncation_specs (list), binning_specs (list), cols_to_prefix (list), and cols_unchanged (list).
     """
     truncation_specs = []
-    binning_specs = []
-    cols_to_prefix = []
+    overall_binning_specs = []
+    yearly_binning_specs = []
+    cols_to_prefix_colname = []
+    cols_to_prefix_value = []
     cols_unchanged = []
 
     for col, specs in columns.items():
         if "truncate" in specs:
             truncation_specs.append((col, specs["truncate"]))
-        if "bin" in specs:
-            binning_specs.append((col, specs["bin"]))
-        if specs.get("prefix", False):
-            cols_to_prefix.append(col)
+        if "overall_bin" in specs:
+            overall_binning_specs.append((col, specs["overall_bin"]))
+        if "yearly_bin" in specs:
+            yearly_binning_specs.append(
+                (col, specs["yearly_bin"][0], specs["yearly_bin"][1])
+            )
+        if specs.get("prefix_colname", False):
+            cols_to_prefix_colname.append(col)
+        if specs.get("prefix_value", False):
+            cols_to_prefix_value.append((col, specs["prefix_value"]))
         if specs.get("unchanged", False):
             cols_unchanged.append(col)
 
-    return truncation_specs, binning_specs, cols_to_prefix, cols_unchanged
+    return (
+        truncation_specs,
+        overall_binning_specs,
+        yearly_binning_specs,
+        cols_to_prefix_colname,
+        cols_to_prefix_value,
+        cols_unchanged,
+    )
 
 
 def replace_zero_with_null(df: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
@@ -398,4 +562,81 @@ def remove_prefix_from_cols(df: pl.DataFrame, prefix: str) -> pl.DataFrame:
     """
     return df.rename(
         {col: col[len(prefix) :] for col in df.columns if col.startswith(prefix)}
+    )
+
+
+def bin_numeric_column(
+    df: pl.DataFrame, col: str, cutoffs: List[float]
+) -> pl.DataFrame:
+    """
+    Bin a numeric column into string labels based on provided cutoffs.
+
+    For each adjacent pair of cutoffs, values greater than the lower cutoff
+    and less than or equal to the upper cutoff are assigned a label
+    "bin_{lower}_{upper}". Values above the last cutoff are labeled as
+    "over_{last_cutoff}". Values not falling into any bin are labeled as "unbinned".
+
+    Args:
+        df (pl.DataFrame): The Polars DataFrame.
+        col (str): The name of the column to bin.
+        cutoffs (List[float]): A sorted list of cutoff values.
+
+    Returns:
+        pl.DataFrame: The DataFrame with an added column "{col}_binned" containing bin labels.
+    """
+    if col not in df.columns:
+        raise ValueError(f"Column '{col}' not found in DataFrame.")
+    if not cutoffs:
+        raise ValueError("Cutoffs list cannot be empty.")
+
+    expr = None
+    # Build the when-then chain for adjacent cutoff pairs.
+    for i in range(len(cutoffs) - 1):
+        lower, upper = cutoffs[i], cutoffs[i + 1]
+        condition = (pl.col(col) > lower) & (pl.col(col) <= upper)
+        if lower + 1 == upper:
+            label = f"manual_bin_{upper}"
+        else:
+            label = f"manual_bin_{lower}_{upper}"
+        if expr is None:
+            expr = pl.when(condition).then(pl.lit(label))
+        else:
+            expr = expr.when(condition).then(pl.lit(label))
+
+    # Condition for values above the last cutoff.
+    expr = (
+        expr.when(pl.col(col) > cutoffs[-1])
+        .then(pl.lit(f"over_{cutoffs[-1]}"))
+        .otherwise(pl.lit(None, pl.Utf8))
+    )
+
+    return df.with_columns(expr.alias(f"manual_bin_{col}"))
+
+
+def normalize_by_year(df: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
+    """
+    Normalize specified columns within each year group using z-score.
+
+    Args:
+        df (pl.DataFrame): Input DataFrame containing a 'year' column.
+        columns (list[str]): List of column names (str) to normalize.
+    """
+    return (
+        df.group_by("year")
+        .agg(
+            [
+                *[pl.col(c).mean().alias(f"{c}_mean") for c in columns],
+                *[pl.col(c).std().alias(f"{c}_std") for c in columns],
+            ]
+        )
+        .join(df, on="year")
+        .with_columns(
+            [
+                ((pl.col(c) - pl.col(f"{c}_mean")) / pl.col(f"{c}_std")).alias(
+                    f"{c}_norm"
+                )
+                for c in columns
+            ]
+        )
+        .select(df.columns + [f"{c}_norm" for c in columns])
     )

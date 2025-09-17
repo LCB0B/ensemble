@@ -1,12 +1,16 @@
 """ Controls Paths """
 
-from pathlib import Path
-import random
-import platform
 import getpass
+import os
+import platform
+import random
 import shutil
-from src.utils import print_main
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Optional
+
+from src.utils import print_main
 
 
 class ProjectPaths:
@@ -14,7 +18,7 @@ class ProjectPaths:
     Class containing file paths for the project directory and its subdirectories.
     """
 
-    def __init__(self, k_home: str = "ensemble/") -> None:
+    def __init__(self, k_home: str = "/home/louibo/ensemble") -> None:
         """
         Initialize the ProjectPaths class with base directory.
 
@@ -22,14 +26,14 @@ class ProjectPaths:
             k_home (str): The base directory of the project.
         """
         if platform.system() == "Linux":
-            self.FPATH_PROJECT = Path(f"/home/{getpass.getuser()}/{k_home}")
-            #self.FPATH_D_DRIVE = Path(rf"/mnt/dwork/users/{getpass.getuser()}")
-            self.FPATH_D_DRIVE = Path(f"/home/{getpass.getuser()}/{k_home}")
+            self.FPATH_PROJECT = Path(f"{k_home}")
+            self.FPATH_D_DRIVE =  Path(f"{k_home}")
         else:
             self.FPATH_PROJECT = Path(rf"K:/{k_home}")
             self.FPATH_D_DRIVE = Path(rf"D:/work/{getpass.getuser()}")
 
-        self.DATA = self.FPATH_D_DRIVE / "data"
+        self.DATA = self.FPATH_D_DRIVE / "data" / 'data_reverted'
+        self.NETWORK_DATA = self.FPATH_PROJECT / "data" / 'data_reverted'
         # TODO: Decide whether to log to local or network
         # self.CHECKPOINTS: Path = self.FPATH_D_DRIVE / "checkpoints"
         self.CHECKPOINTS = self.FPATH_PROJECT / "checkpoints"
@@ -41,13 +45,15 @@ class ProjectPaths:
         self.TABLES = self.FPATH_PROJECT / "tables"
         self.FIGURES = self.FPATH_PROJECT / "figures"
         self.TEMP_FILES = self.DATA / "temp_files"
-        #self.TEMP_FILES.mkdir(parents=True, exist_ok=True)
+        # self.TEMP_FILES.mkdir(parents=True, exist_ok=True)
         self.DUMP_DIR = self.DATA / "dumps"
+        self.NETWORK_DUMP_DIR = self.NETWORK_DATA / "dumps"
         self.LOGS = self.FPATH_PROJECT / "logs"
         self.TB_LOGS = self.LOGS / "transformer_logs"
         self.BASELINE_LOGS = self.LOGS / "tabular_logs"
         self.OPTUNA = self.LOGS / "optuna"
-        self.GENERATED = self.FPATH_PROJECT / "generated"
+        self.DEFAULT_MODEL = self.CHECKPOINTS_TRANSFORMER / 'destiny' / 'model'  / 'best.ckpt'
+        self.DEFAULT_HPARAMS = self.CONFIGS /'destiny' / 'hparams_destiny_pretrain.yaml'
 
     def swap_drives(self, fpath: Path):
         """Swaps the drive of fpath by checking parts and replacing with opposite drive"""
@@ -72,7 +78,7 @@ class ProjectPaths:
         """
         dest_path = self.swap_drives(fpath)
         if fpath.is_dir():
-            shutil.copytree(fpath, dest_path)
+            shutil.copytree(fpath, dest_path, dirs_exist_ok=True)
         else:
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(fpath, dest_path)
@@ -98,7 +104,7 @@ def check_and_copy_file(file_path: Path):
         print_main(f"{file_path} exists.")
 
 
-def check_and_copy_file_or_dir(file_path: Path) -> None:
+def check_and_copy_file_or_dir(file_path: Path, verbosity=3) -> None:
     """
     Checks if a file or directory exists on the specified drive first, then the opposite drive.
     If it exists on the opposite drive, copies it to the specified drive and uses it.
@@ -106,20 +112,24 @@ def check_and_copy_file_or_dir(file_path: Path) -> None:
 
     Args:
         file_path (Path): The path of the file or directory to check and copy if needed.
+        verbosity (int): 0 no prints, 1 print only existence, 2 print non-existence, 3 print all
     """
     if file_path.exists():
-        print_main(f"{file_path} exists on this drive.")
+        if verbosity in [1, 3]:
+            print(f"{file_path} exists on this drive.")
         return True
 
     swapped_fpath = FPATH.swap_drives(file_path)
     if swapped_fpath.exists():
-        print(
-            f"{file_path} does not exist on this drive. Initiating copy from {swapped_fpath}"
-        )
+        if verbosity in [2, 3]:
+            print(
+                f"{file_path} does not exist on this drive. Initiating copy from {swapped_fpath}"
+            )
         FPATH.alternative_copy_to_opposite_drive(swapped_fpath)
         return True
     else:
-        print(f"{file_path} does not exist on either drive.")
+        if verbosity in [2, 3]:
+            print(f"{file_path} does not exist on either drive.")
         return False
 
 
@@ -174,3 +184,58 @@ def get_newest_path(path: Path) -> Optional[Path]:
         if newest:
             return newest.name
     return None
+
+
+@contextmanager
+def local_copy(file_path: str):
+    """
+    Context manager to copy a file to a local temp directory and clean it up after use.
+
+    Args
+        file_path (str): (str) Path to the original file.
+
+    Yields:
+        str: Local temp file path.
+    """
+    temp_dir = tempfile.mkdtemp()
+    local_file = os.path.join(temp_dir, os.path.basename(file_path))
+    copy_file_or_dir(file_path, local_file)
+    try:
+        yield local_file
+    finally:
+        shutil.rmtree(temp_dir)
+
+
+import re
+
+
+def get_wandb_runid_filter_away_nonconforming(file_dir: Path) -> str:
+    """
+    Generates a run ID using an incrementing 3-digit number based on existing files
+    in the directory that start with a 3-digit prefix followed by an underscore.
+
+    Args:
+        file_dir (Path): Directory to scan for existing runs.
+    """
+    pattern = re.compile(r"^(\d{3})_")
+
+    # fmt: off
+    adjectives =['abundant', 'accessible', 'accommodating', 'accurate', 'adaptable', 'adept', 'admirable', 'adorable', 'adventurous', 'affable', 'affectionate', 'aggressive', 'agile', 'agreeable', 'agreeing', 'alert', 'alive', 'alluring', 'amazed', 'amazing', 'amiable', 'amused', 'amusing', 'angry', 'annoyed', 'annoying', 'anxious', 'apprehensive', 'arrogant', 'artful', 'artistic', 'ashamed', 'assertive', 'astonishing', 'astute', 'attentive', 'attractive', 'audacious', 'authentic', 'average', 'avid', 'awful', 'bad', 'balanced', 'beautiful', 'benevolent', 'better', 'bewildered', 'black', 'blissful', 'bloody', 'blue', 'blushing', 'bold', 'bored', 'brainy', 'brave', 'breakable', 'bright', 'brilliant', 'bubbly', 'buoyant', 'busy', 'calm', 'capable', 'carefree', 'careful', 'caring', 'cautious', 'centered', 'charismatic', 'charming', 'cheerful', 'chilly', 'classy', 'clean', 'clear', 'clever', 'cloudy', 'clumsy', 'colorful', 'colossal', 'combative', 'comfortable', 'committed', 'compassionate', 'competent', 'concerned', 'condemned', 'confident', 'confused', 'considerate', 'constructive', 'contemplative', 'content', 'convivial', 'cooperative', 'cordial', 'courageous', 'courteous', 'crafty', 'crazy', 'creative', 'credible', 'creepy', 'crowded', 'cruel', 'curious', 'curvy', 'cute', 'dangerous', 'daring', 'dark', 'dashing', 'dead', 'decisive', 'dedicated', 'defeated', 'defiant', 'deliberate', 'delightful', 'dependable', 'depressed', 'desirable', 'determined', 'devoted', 'different', 'difficult', 'dignified', 'diligent', 'diplomatic', 'direct', 'discerning', 'discreet', 'disgusted', 'distinct', 'disturbed', 'dizzy', 'doubtful', 'drab', 'dull', 'dynamic', 'eager', 'earnest', 'easy', 'effective', 'efficient', 'elated', 'elegant', 'eloquent', 'embarrassed', 'empathetic', 'enchanting', 'encouraging', 'energetic', 'engaged', 'enthusiastic', 'envious', 'ethical', 'evil', 'excited', 'exemplary', 'exotic', 'expensive', 'experienced', 'extraordinary', 'exuberant', 'fair', 'faithful', 'famous', 'fancy', 'fantastic', 'fearless', 'fierce', 'fiery', 'filthy', 'fine', 'focused', 'foolish', 'forthright', 'fragile', 'frail', 'frantic', 'friendly', 'frightened', 'funny', 'gentle', 'genuine', 'gifted', 'giving', 'glamorous', 'gleaming', 'glorious', 'good', 'gorgeous', 'graceful', 'gregarious', 'grieving', 'grotesque', 'grumpy', 'handsome', 'happy', 'hardworking', 'harmonious', 'healthy', 'helpful', 'helpless', 'heroic', 'hilarious', 'homeless', 'homely', 'honest', 'hopeful', 'horrible', 'humble', 'humorous', 'hungry', 'hurt', 'ill', 'imaginative', 'impartial', 'important', 'impossible', 'incomparable', 'independent', 'inexpensive', 'ingenious', 'innocent', 'innovative', 'inquisitive', 'inspired', 'inspiring', 'intellectual', 'intelligent', 'intuitive', 'inventive', 'inviting', 'itchy', 'jealous', 'jittery', 'jolly', 'jovial', 'joyful', 'joyous', 'judicious', 'just', 'keen', 'kind', 'knowledgeable', 'laudable', 'lazy', 'leaderly', 'lenient', 'light', 'likable', 'lively', 'logical', 'lonely', 'long', 'lovely', 'loyal', 'lucid', 'lucky', 'magical', 'magnificent', 'majestic', 'mature', 'methodical', 'meticulous', 'mighty', 'mindful', 'misty', 'modern', 'modest', 'motionless', 'motivated', 'muddy', 'mushy', 'mysterious', 'nasty', 'natural', 'naughty', 'nervous', 'nice', 'nifty', 'noble', 'nurturing', 'nutty', 'obedient', 'obnoxious', 'odd', 'open', 'optimistic', 'orderly', 'organized', 'outgoing', 'outrageous', 'outstanding', 'panicky', 'passionate', 'patient', 'peaceful', 'perceptive', 'perfect', 'persistent', 'philosophical', 'plain', 'playful', 'pleasant', 'poised', 'polished', 'poor', 'positive', 'powerful', 'practical', 'precious', 'precise', 'prickly', 'proactive', 'productive', 'proficient', 'proud', 'prudent', 'punctual', 'putrid', 'puzzled', 'quaint', 'quick', 'radiant', 'rational', 'real', 'reliable', 'relieved', 'remarkable', 'repulsive', 'resilient', 'resolute', 'resourceful', 'respectful', 'responsible', 'responsive', 'reverent', 'rich', 'robust', 'savvy', 'scary', 'scholarly', 'selfish', 'selfless', 'sensible', 'serene', 'sharp', 'shiny', 'shrewd', 'shy', 'silly', 'sincere', 'skillful', 'sleepy', 'smart', 'smiling', 'smoggy', 'sociable', 'solid', 'sore', 'sparkling', 'spirited', 'splendid', 'spontaneous', 'spotless', 'steadfast', 'steady', 'stormy', 'strange', 'strategic', 'strong', 'studious', 'stupid', 'successful', 'super', 'supportive', 'sustainable', 'sympathetic', 'tactful', 'talented', 'tame', 'tasty', 'tenacious', 'tender', 'tense', 'terrible', 'thankful', 'thoughtful', 'thoughtless', 'thriving', 'tired', 'tireless', 'tolerant', 'tough', 'troubled', 'trustworthy', 'ugliest', 'ugly', 'unassuming', 'unbiased', 'understanding', 'uninterested', 'unique', 'unsightly', 'unusual', 'upbeat', 'upset', 'uptight', 'vast', 'versatile', 'vibrant', 'victorious', 'vigilant', 'vivacious', 'vivid', 'wandering', 'warm', 'weary', 'wicked', 'wild', 'wise', 'witty', 'worried', 'worrisome', 'wrong', 'youthful', 'zany', 'zealous', 'zestful']
+    nouns = ["tiger", "falcon", "whale", "dragon", "phoenix", "eagle", "panther", "lion", "wolf", "hawk", "unicorn", "griffin", "centaur", "hydra", "lynx", "serpent", "kraken", "bear", "cheetah", "orca", "rhino", "cougar", "leopard", "cobra", "jaguar", "raven", "sparrow", "sphinx", "chameleon", "pelican", "giraffe", "fox", "ocelot", "mustang", "buffalo", "stallion", "hippo", "bison", "shark", "gazelle", "otter", "penguin"]
+    # fmt: on
+
+    run_numbers = []
+    for f in file_dir.glob("*"):
+        match = pattern.match(f.stem)
+        if match:
+            run_numbers.append(int(match.group(1)))
+
+    if run_numbers:
+        run_number = str(max(run_numbers) + 1).zfill(3)
+    else:
+        run_number = "001"
+
+    run_id = f"{run_number}_{random.choice(adjectives)}_{random.choice(nouns)}"
+
+    print_main("Starting run with run_id:", run_id)
+    return run_id

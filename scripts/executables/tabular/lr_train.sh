@@ -1,0 +1,1 @@
+python tabular/lr_train.py 

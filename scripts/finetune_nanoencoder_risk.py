@@ -1,15 +1,17 @@
 import os
-import torch._dynamo.compiled_autograd
+import warnings
 import yaml
 import torch
-import warnings
+import torch._dynamo.compiled_autograd
 import pyarrow.dataset as ds
 import polars as pl
+from pathlib import PosixPath
 
 from src.datamodule2 import (
     RiskFinetuneLifeLightningDataModule,
 )
 from src.encoder_nano_risk import RiskNanoEncoder
+from src.prediction_writer import SaveSimpleInfo
 from src.paths import FPATH, check_and_copy_file_or_dir, get_wandb_runid
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import (
@@ -18,29 +20,18 @@ from lightning.pytorch.callbacks import (
 )
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch import seed_everything
-from lightning.pytorch.profilers import (
-    SimpleProfiler,
-    AdvancedProfiler,
-    PyTorchProfiler,
-)
-
-# This is an erroneous warning, the mask is indeed already bool
-warnings.filterwarnings(
-    "ignore",
-    message="Converting mask without torch.bool dtype to bool; this will negatively affect performance. Prefer to use a boolean mask directly.",
-    category=UserWarning,
-    module="torch.nn.modules.activation",
-)
 
 if __name__ == "__main__":
+    warnings.simplefilter(action="ignore", category=FutureWarning)
     torch._dynamo.config.cache_size_limit = 16
     # Load hparams
     with open(
         FPATH.CONFIGS / "hparams_finetune2.yaml", "r", encoding="utf-8"
     ) as stream:
         hparams = yaml.safe_load(stream)
-    run_id = f"{get_wandb_runid(FPATH.TB_LOGS / hparams['experiment_name'])}-{hparams['outcome'].split('_')[1]}-newrope_long"
-    print(f"Experiment: {hparams['experiment_name']} / {run_id}")
+    # run_id = f"{get_wandb_runid(FPATH.TB_LOGS / hparams['experiment_name'])}-simple-{hparams['outcome'].split('/')[1]}-grid"
+    num = get_wandb_runid(FPATH.TB_LOGS / hparams["experiment_name"]).split("_")[0]
+    run_id = f"{num}_{hparams['dir_path']}-{hparams['outcome'].split('/')[-1].split('_')[1]}-grid"
 
     seed_everything(73)
     # Set training variables
@@ -53,13 +44,18 @@ if __name__ == "__main__":
 
     #### Data ####
     source_paths = [
-        (FPATH.DATA / path).with_suffix(".parquet") for path in hparams["sources"]
+        (FPATH.DATA / hparams["source_dir"] / path).with_suffix(".parquet")
+        for path in hparams["sources"]
     ]
-    background_path = (FPATH.DATA / hparams["background"]).with_suffix(".parquet")
-    outcomes_path = (FPATH.DATA / hparams["outcome"]).with_suffix(".parquet")
+    background_path = (
+        FPATH.DATA / hparams["source_dir"] / hparams["background"]
+    ).with_suffix(".parquet")
+    outcomes_path = (
+        FPATH.DATA / hparams["source_dir"] / hparams["outcome"]
+    ).with_suffix(".parquet")
 
     for s in source_paths + [background_path, outcomes_path]:
-        check_and_copy_file_or_dir(s)
+        check_and_copy_file_or_dir(s, verbosity=2)
 
     sources = [ds.dataset(s, format="parquet") for s in source_paths]
     background = pl.read_parquet(background_path)
@@ -75,27 +71,45 @@ if __name__ == "__main__":
         sep_token=hparams["sep_token"],
         segment=hparams["segment"],
         subset_background=hparams["subset_background"],
-        batch_size=hparams["batch_size"],
+        n_tokens=hparams["n_tokens"],
+        lengths=hparams["lengths"],
         num_workers=hparams["num_workers"],
         max_seq_len=hparams["max_seq_len"],
         prediction_windows=hparams["prediction_windows"],
         negative_censor=hparams["negative_censor"],
+        source_dir=hparams["source_dir"],
     )
     dm.prepare_data()  # TODO: Ideally we should not call this and let Lightning call it (and get the dm info somewhere else)
 
     # get vocab size
     hparams["vocab_size"] = len(dm.pipeline.vocab)
 
-    # The iterations are spread out over the devices, hence the division by devices
-    hparams["steps_per_epoch"] = dm.get_steps_per_train_epoch() / N_DEVICES
-    hparams["optimizer_max_iters"] = hparams["max_epochs"] * hparams["steps_per_epoch"]
-
-    # Load checkpoint if fine-tuning
     model = RiskNanoEncoder(**hparams)
+    # Load pretrained model
+    if ckpt_path := hparams.get("load_pretrained_model"):
+        print(f"Loading checkpoint: {ckpt_path}")
+        ckpt_path = FPATH.CHECKPOINTS_TRANSFORMER / ckpt_path
+        torch.serialization.add_safe_globals([PosixPath])
 
-    if hparams["compile"]:
-        model = torch.compile(model, dynamic=False)
-        print("Model has been compiled")
+        model = model.load_from_checkpoint(
+            ckpt_path,
+            strict=False,
+            **hparams,
+        )
+
+        # Need to set the optimizer information, else it will use those from pretrained model
+        set_hparams_list = [
+            "learning_rate",
+            # "steps_per_epoch",
+            # "optimizer_max_iters",
+            # "optimizer_warmup_epochs",
+        ]
+        for hparam in set_hparams_list:
+            model.hparams[hparam] = hparams[hparam]
+        optimizers_and_schedulers = model.configure_optimizers()
+
+        run_id += f"-ckpt_{ckpt_path.parts[-2]}"
+    print(f"Experiment: {hparams['experiment_name']} / {run_id}")
 
     # Trainer setup
     logger = TensorBoardLogger(
@@ -106,7 +120,7 @@ if __name__ == "__main__":
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
     checkpoint_callback = ModelCheckpoint(
-        dirpath=FPATH.CHECKPOINTS / hparams["experiment_name"] / run_id,
+        dirpath=FPATH.CHECKPOINTS_TRANSFORMER / hparams["experiment_name"] / run_id,
         filename="best",
         save_top_k=1,
         save_last=True,
@@ -117,7 +131,18 @@ if __name__ == "__main__":
         checkpoint_callback,
     ]
 
-    # profiler = SimpleProfiler(filename="simple_profiler")
+    # Prediction writing
+    if hparams.get("save_preds"):
+        pred_writer = SaveSimpleInfo(
+            fname=(
+                FPATH.FPATH_PROJECT
+                / "data"
+                / "preds"
+                / hparams["experiment_name"]
+                / run_id
+            ).with_suffix(".pt")
+        )
+        callbacks.append(pred_writer)
 
     trainer = Trainer(
         max_epochs=hparams["max_epochs"],
@@ -128,9 +153,14 @@ if __name__ == "__main__":
         strategy="auto",
         deterministic=False,
         precision=hparams["precision"],
-        log_every_n_steps=50,
-        # profiler=profiler,
+        log_every_n_steps=100,
+        num_sanity_val_steps=0,
+        # val_check_interval=1500,
+        fast_dev_run=1000,
+        # limit_train_batches=500,
+        # limit_val_batches=2,
     )
 
     # Train
     trainer.fit(model, datamodule=dm)
+    # trainer.predict(model, datamodule=dm, ckpt_path="best")

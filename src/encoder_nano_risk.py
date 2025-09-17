@@ -8,28 +8,21 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 """
 
 import math
-from typing import Dict, Any, Tuple
-import pandas as pd
-from torch.optim.lr_scheduler import LinearLR
-from src.lr_schedulers import CosineWarmupScheduler
-from src.time2vec import Time2Vec
-from src.utils import print_main
-from src.encoder_blocks import (
-    Block,
-    CumulativeProbabilityLayer,
-    SinusoidalPositionalEmbedding,
-    RotaryPositionalEmbeddings,
-)
+from typing import Any, Dict, Tuple
+
+import lightning.pytorch as pl
 import torch
 import torch.nn as nn
-import lightning.pytorch as pl
-from torchmetrics import AUROC, AveragePrecision, Accuracy, Recall, Precision
-
 import torch.nn.functional as F
-from typing import Dict, Any, Tuple, Optional
 
+from flash_attn.bert_padding import pad_input, unpad_input
+from flash_attn.losses.cross_entropy import CrossEntropyLoss as FACrossEntropyLoss
+from torch.optim.lr_scheduler import LinearLR
+from src.encoder_blocks import Block, CumulativeProbabilityLayer
+from src.metrics import CustomROCS, FusedAccuracyAtK, BestAtThreshold
+from src.time2vec import Time2Vec
+from src.utils import print_main
 
-import pdb
 
 class BaseNanoEncoder(pl.LightningModule):
     def __init__(self, *args, **kwargs):
@@ -51,13 +44,6 @@ class BaseNanoEncoder(pl.LightningModule):
         self.embedding = nn.Embedding(
             self.hparams.vocab_size, self.hparams.d_model, padding_idx=0
         )
-        # self.pos_embeddings = SinusoidalPositionalEmbedding(
-        #     self.hparams.max_seq_len, self.hparams.d_model // self.hparams.num_heads
-        # )
-        self.pos_embeddings = RotaryPositionalEmbeddings(
-            max_seq_len=self.hparams.max_seq_len,
-            dim=self.hparams.d_model // self.hparams.num_heads,
-        )
         self.segment_embeddings = nn.Embedding(
             self.hparams.max_seq_len, self.hparams.d_model, padding_idx=0
         )
@@ -71,9 +57,7 @@ class BaseNanoEncoder(pl.LightningModule):
                             num_heads=self.hparams.num_heads,
                             dropout=self.hparams.dropout,
                             bias=self.hparams.bias,
-                            dim_feedforward=self.hparams.dim_feedforward,
-                            compiled=self.hparams.compile,
-                            swiglu=self.hparams.swiglu,
+                            max_seq_len=self.hparams.max_seq_len,
                         )
                         for _ in range(self.hparams.num_layers)
                     ]
@@ -106,29 +90,27 @@ class BaseNanoEncoder(pl.LightningModule):
         x += self.t2v_abspos(batch["abspos"])
         x += self.t2v_age(batch["age"])
 
-        if "segment" in batch:
-            x += self.segment_embeddings(batch["segment"])
+        x += self.segment_embeddings(batch["segment"])
 
         return x
 
-    @torch.compile(dynamic=False)
-    def forward(self, batch: Dict[str, Any]):
+    @torch.compile(dynamic=True)
+    def forward(self, batch: Dict[str, Any], repad=True):
+        B, T = batch["attn_mask"].shape
         x = self.embed_information(batch)
-
-
-        # (bs, seq_len) -> (bs, num_heads, seq_len, embed_size_per_head)
-        sinusoidal_pos = (
-            self.pos_embeddings
-        )  # self.pos_embeddings(x.shape)[None, None, :, :]
 
         # forward the GPT model itself
         x = self.transformer.drop(x)
         for block in self.transformer.h:
-            x = block(x, attn_mask=batch["attn_mask"], sinusoidal_pos=sinusoidal_pos)
+            x = block(x, batch)
         x = self.transformer.ln_f(x)
+
+        # Repad
+        if (x.ndim == 2) and repad:
+            x = pad_input(x, batch["indices"], B, T)
+
         return x
 
-    @torch.compile(dynamic=False)
     def standard_step(
         self, batch: Dict[str, Any], batch_idx: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -182,820 +164,23 @@ class BaseNanoEncoder(pl.LightningModule):
                     optimizer,
                     start_factor=1e-4,
                     end_factor=1,
-                    total_iters=int(
-                        self.hparams["steps_per_epoch"]
-                        * self.hparams["optimizer_warmup_epochs"]
-                    ),
+                    total_iters=self.hparams["warmup_steps"],
                 ),
-                # "scheduler": CosineWarmupScheduler(
-                #     optimizer,
-                #     warmup=int(
-                #         self.hparams["steps_per_epoch"]
-                #         * self.hparams["optimizer_warmup_epochs"]
-                #     ),
-                #     max_iters=self.hparams.optimizer_max_iters,
-                # ),
                 "interval": "step",
                 "frequency": 1,
                 "name": "learning_rate",
             },
         }
 
-class CausalEncoder(BaseNanoEncoder):
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
-        # Loss function for next-token prediction
-        self.criterion = nn.CrossEntropyLoss(ignore_index=0)
-
-        # Decoder layer to map the output embeddings to vocabulary logits
-        self.decoder = nn.Linear(
-            self.hparams.d_model, self.hparams.vocab_size, bias=False
-        )
-
-        # Tie weights
-        if hasattr(self, 'embedding') and self.embedding.weight.shape == self.decoder.weight.shape:
-             self.decoder.weight = self.embedding.weight
-        else:
-             print("Warning: Could not tie decoder and embedding weights.")
-
-    def standard_step(
-        self, batch: Dict[str, Any], batch_idx: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Implements the standard step for causal language modeling.
-
-        Args:
-            batch (Dict[str, Any]): A dictionary containing input data and target labels.
-            batch_idx (int): The index of the current batch.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: The loss value and the logits.
-        """
-        # Forward pass
-        x = self.forward(batch)
-
-        # Decode outputs into vocabulary logits
-        logits = self.decoder(x)  # Shape: (batch_size, seq_len, vocab_size)
-
-        # Flatten logits and targets for loss computation
-        logits = logits.view(-1, self.hparams.vocab_size)  # Flatten for CrossEntropyLoss
-        targets = batch["target"].view(-1)
-
-        # Calculate loss
-        loss = self.criterion(logits, targets)
-        return loss, logits
-    
-    
-    def predict_step(self, batch, batch_idx: int, predict_index=-1, strategy="most_likely", k=5, p=0.9, temperature=1.0):
-        """
-        Predict step supporting multiple prediction strategies with temperature scaling for a specified position.
-
-        Args:
-            batch (dict): Input batch containing 'input_ids' and possibly 'attention_mask'.
-            batch_idx (int): Index of the current batch.
-            predict_index (int): Index of the hidden state to use for prediction (default: -1, last position).
-            strategy (str): Prediction strategy ("most_likely", "top_k", "top_p").
-            k (int): Number of tokens to consider for top-k sampling (only for "top_k").
-            p (float): Cumulative probability threshold for nucleus sampling (only for "top_p").
-            temperature (float): Temperature parameter for scaling logits.
-        
-        Returns:
-            Tensor: Predicted token indices for the batch.
-        """
-        # Forward pass through the model
-        output = self(batch)
-        # Get logits for the specified position
-        logits = self.decoder(output[:, predict_index, :])  # Use predict_index instead of -1
-
-        # Apply temperature scaling
-        scaled_logits = logits / temperature
-        probs = F.softmax(scaled_logits, dim=-1)  # Convert to probabilities
-
-        # Most likely outcome (argmax)
-        if strategy == "most_likely":
-            predictions = torch.argmax(probs, dim=-1)
-
-        # Top-k sampling
-        elif strategy == "top_k":
-            top_k_probs, top_k_indices = torch.topk(probs, k, dim=-1)
-            sampled_indices = torch.multinomial(top_k_probs, num_samples=1).squeeze(-1)
-            predictions = top_k_indices[range(top_k_indices.size(0)), sampled_indices]
-
-        # Nucleus sampling (Top-p sampling)
-        elif strategy == "top_p":
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
-            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-            # Mask tokens beyond the top-p cumulative probability
-            mask = cumulative_probs <= p
-            mask[:, 0] = True  # Ensure at least one token is kept
-            sorted_probs[~mask] = 0
-            sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)  # Re-normalize
-            sampled_indices = torch.multinomial(sorted_probs, num_samples=1).squeeze(-1)
-            predictions = sorted_indices[range(sorted_indices.size(0)), sampled_indices]
-
-        else:
-            raise ValueError(f"Unsupported strategy: {strategy}")
-
-        return predictions
-    
-    def generate_sequence(self, batch, prompt_length, max_new_tokens, strategy="most_likely", k=5, p=0.95, temperature=1.0):
-        """
-        Generate a sequence of event tokens starting from a prompt using the predict_step method.
-
-        Args:
-            batch (dict): Input batch with keys 'event', 'age', 'abspos', 'segment', 'attn_mask', etc.
-                        The 'event' key contains the initial prompt sequence, possibly padded.
-            prompt_length (int): Length of the prompt sequence in the 'event' tensor.
-            max_new_tokens (int): Number of new tokens to generate.
-            strategy (str): Sampling strategy for predict_step ("most_likely", "top_k", "top_p").
-            k (int): Number of tokens to consider for top-k sampling.
-            p (float): Cumulative probability txwhreshold for nucleus sampling.
-            temperature (float): Temperature for scaling logits in predict_step.
-
-        Returns:
-            torch.Tensor: Generated event tokens of shape (batch_size, max_new_tokens).
-        """
-        # Make a deep copy of the batch to avoid modifying the original
-        current_batch = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        batch_size = current_batch['event'].size(0)
-        max_seq_len = current_batch['event'].size(1)
-        generated_tokens = []
-
-        # Ensure the batch has enough space for new tokens
-        if prompt_length + max_new_tokens > max_seq_len:
-            raise ValueError(f"Prompt length ({prompt_length}) + max_new_tokens ({max_new_tokens}) exceeds maximum sequence length ({max_seq_len})")
-
-        for _ in range(max_new_tokens):
-            # Current length is the prompt plus the number of generated tokens
-            current_length = prompt_length + len(generated_tokens)
-            # Predict the next token using predict_step at the last position of the current sequence
-            next_token = self.predict_step(
-                current_batch,
-                batch_idx=0,
-                predict_index=current_length - 1,
-                strategy=strategy,
-                k=k,
-                p=p,
-                temperature=temperature
-            )
-            # Update the 'event' sequence with the predicted token
-            current_batch['event'][:, current_length] = next_token
-            # Collect the predicted token
-            generated_tokens.append(next_token.unsqueeze(-1))
-
-        # Combine all generated tokens into a single tensor
-        generated_sequence = torch.cat(generated_tokens, dim=1)  # Shape: (batch_size, max_new_tokens)
-        return generated_sequence
-    
-    def generate_sequence_batched(self, batch, prompt_length, max_new_tokens, num_simulations=1, strategy="most_likely", k=5, p=0.95, temperature=1.0):
-        """
-        Optimized sequence generation that batches multiple simulations together.
-        
-        Args:
-            batch (dict): Input batch with keys 'event', 'age', 'abspos', 'segment', 'attn_mask', etc.
-            prompt_length (int): Length of the prompt sequence.
-            max_new_tokens (int): Number of new tokens to generate.
-            num_simulations (int): Number of simulations to run in parallel.
-            strategy (str): Sampling strategy ("most_likely", "top_k", "top_p").
-            k (int): Number of tokens for top-k sampling.
-            p (float): Probability threshold for nucleus sampling.
-            temperature (float): Temperature for scaling logits.
-            
-        Returns:
-            torch.Tensor: Generated sequences of shape (batch_size, num_simulations, max_new_tokens).
-        """
-        batch_size = batch['event'].size(0)
-        max_seq_len = batch['event'].size(1)
-        
-        # Ensure we have enough space
-        if prompt_length + max_new_tokens > max_seq_len:
-            raise ValueError(f"Prompt length ({prompt_length}) + max_new_tokens ({max_new_tokens}) exceeds maximum sequence length ({max_seq_len})")
-        
-        # Expand batch to include all simulations
-        expanded_batch = {}
-        for key, value in batch.items():
-            if isinstance(value, torch.Tensor):
-                # Repeat tensor for each simulation: [batch_size, ...] -> [batch_size * num_simulations, ...]
-                expanded_batch[key] = value.repeat(num_simulations, *([1] * (value.dim() - 1)))
-            else:
-                expanded_batch[key] = value
-        
-        # Generate sequences for all simulations at once (with caching)
-        generated_flat = self.generate_sequence_with_cache(
-            expanded_batch, prompt_length, max_new_tokens, strategy, k, p, temperature
-        )
-        
-        # Reshape to separate simulations: [batch_size * num_simulations, max_new_tokens] -> [batch_size, num_simulations, max_new_tokens]
-        generated_sequence = generated_flat.view(batch_size, num_simulations, max_new_tokens)
-        
-        return generated_sequence
-    
-    def generate_sequence_optimized(self, batch, prompt_length, max_new_tokens, strategy="most_likely", k=5, p=0.95, temperature=1.0):
-        """
-        Memory-optimized version of generate_sequence with reduced tensor copying.
-        
-        Args:
-            batch (dict): Input batch.
-            prompt_length (int): Length of the prompt sequence.
-            max_new_tokens (int): Number of new tokens to generate.
-            strategy (str): Sampling strategy.
-            k (int): Number of tokens for top-k sampling.
-            p (float): Probability threshold for nucleus sampling.
-            temperature (float): Temperature for scaling logits.
-            
-        Returns:
-            torch.Tensor: Generated event tokens of shape (batch_size, max_new_tokens).
-        """
-        batch_size = batch['event'].size(0)
-        max_seq_len = batch['event'].size(1)
-        
-        # Create working copy only for event tensor (most memory-intensive)
-        working_events = batch['event'].clone()
-        
-        # Pre-allocate tensor for generated tokens
-        generated_tokens = torch.zeros(
-            (batch_size, max_new_tokens), 
-            dtype=working_events.dtype, 
-            device=working_events.device
-        )
-        
-        # Create a view-based batch that references original tensors except for events
-        working_batch = {k: v for k, v in batch.items()}
-        working_batch['event'] = working_events
-        
-        for i in range(max_new_tokens):
-            current_length = prompt_length + i
-            
-            # Predict next token
-            next_token = self.predict_step_optimized(
-                working_batch,
-                predict_index=current_length - 1,
-                strategy=strategy,
-                k=k,
-                p=p,
-                temperature=temperature
-            )
-            
-            # Update working tensor and store generated token
-            working_events[:, current_length] = next_token
-            generated_tokens[:, i] = next_token
-            
-        return generated_tokens
-    
-    def predict_step_optimized(self, batch, predict_index=-1, strategy="most_likely", k=5, p=0.9, temperature=1.0):
-        """
-        Optimized predict_step with reduced memory allocations.
-        """
-        # Forward pass (this is still the main bottleneck - will be addressed with KV cache)
-        output = self(batch)
-        
-        # Get logits for the specified position (avoid tensor copying)
-        logits = self.decoder(output[:, predict_index, :])
-        
-        # Apply temperature scaling in-place
-        logits = logits / temperature
-        
-        # Compute probabilities
-        probs = F.softmax(logits, dim=-1)
-        
-        if strategy == "most_likely":
-            predictions = torch.argmax(probs, dim=-1)
-        elif strategy == "top_k":
-            top_k_probs, top_k_indices = torch.topk(probs, k, dim=-1)
-            sampled_indices = torch.multinomial(top_k_probs, num_samples=1).squeeze(-1)
-            predictions = top_k_indices[range(top_k_indices.size(0)), sampled_indices]
-        elif strategy == "top_p":
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
-            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-            mask = cumulative_probs <= p
-            mask[:, 0] = True  # Ensure at least one token
-            sorted_probs[~mask] = 0
-            sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
-            sampled_indices = torch.multinomial(sorted_probs, num_samples=1).squeeze(-1)
-            predictions = sorted_indices[range(sorted_indices.size(0)), sampled_indices]
-        else:
-            raise ValueError(f"Unsupported strategy: {strategy}")
-            
-        return predictions
-    
-    def generate_sequence_with_cache(self, batch, prompt_length, max_new_tokens, strategy="most_likely", k=5, p=0.95, temperature=1.0):
-        """
-        Generate sequence with simple caching to avoid recomputing the full sequence each time.
-        
-        Args:
-            batch (dict): Input batch.
-            prompt_length (int): Length of the prompt sequence.
-            max_new_tokens (int): Number of new tokens to generate.
-            strategy (str): Sampling strategy.
-            k (int): Number of tokens for top-k sampling.
-            p (float): Probability threshold for nucleus sampling.
-            temperature (float): Temperature for scaling logits.
-            
-        Returns:
-            torch.Tensor: Generated event tokens of shape (batch_size, max_new_tokens).
-        """
-        batch_size = batch['event'].size(0)
-        max_seq_len = batch['event'].size(1)
-        
-        if prompt_length + max_new_tokens > max_seq_len:
-            raise ValueError(f"Prompt length ({prompt_length}) + max_new_tokens ({max_new_tokens}) exceeds maximum sequence length ({max_seq_len})")
-        
-        # Create working copy
-        working_events = batch['event'].clone()
-        working_batch = {k: v for k, v in batch.items()}
-        working_batch['event'] = working_events
-        
-        # Pre-compute embeddings for the prompt once
-        prompt_embeddings = None
-        
-        # Pre-allocate result tensor
-        generated_tokens = torch.zeros(
-            (batch_size, max_new_tokens), 
-            dtype=working_events.dtype, 
-            device=working_events.device
-        )
-        
-        for i in range(max_new_tokens):
-            current_length = prompt_length + i
-            
-            # Use cached computation for efficiency
-            next_token = self._predict_next_with_partial_cache(
-                working_batch,
-                current_length,
-                prompt_embeddings,
-                strategy=strategy,
-                k=k,
-                p=p,
-                temperature=temperature
-            )
-            
-            # Update sequence
-            working_events[:, current_length] = next_token
-            generated_tokens[:, i] = next_token
-            
-        return generated_tokens
-    
-    def _predict_next_with_partial_cache(self, batch, current_length, cached_embeddings=None, 
-                                       strategy="most_likely", k=5, p=0.9, temperature=1.0):
-        """
-        Predict next token with partial caching to avoid full recomputation.
-        This is a simplified version - full KV-cache would be more complex.
-        """
-        # For now, this still does a full forward pass but with optimizations
-        # A full KV-cache implementation would require modifying the transformer blocks
-        
-        # Create a batch slice up to current position to reduce computation
-        batch_slice = {}
-        for key, value in batch.items():
-            if isinstance(value, torch.Tensor) and value.dim() >= 2:
-                if key in ['event', 'age', 'abspos', 'segment']:
-                    # Only process up to current_length + 1
-                    batch_slice[key] = value[:, :current_length + 1]
-                elif key == 'attn_mask':
-                    # Slice attention mask appropriately
-                    if value.dim() == 4:  # [batch, heads, seq, seq]
-                        batch_slice[key] = value[:, :, :current_length + 1, :current_length + 1]
-                    elif value.dim() == 3:  # [batch, seq, seq]
-                        batch_slice[key] = value[:, :current_length + 1, :current_length + 1]
-                    else:
-                        batch_slice[key] = value
-                else:
-                    batch_slice[key] = value
-            else:
-                batch_slice[key] = value
-        
-        # Forward pass on reduced sequence
-        output = self(batch_slice)
-        logits = self.decoder(output[:, -1, :])  # Only use last position
-        
-        # Apply temperature and sampling
-        logits = logits / temperature
-        probs = F.softmax(logits, dim=-1)
-        
-        if strategy == "most_likely":
-            predictions = torch.argmax(probs, dim=-1)
-        elif strategy == "top_k":
-            top_k_probs, top_k_indices = torch.topk(probs, k, dim=-1)
-            sampled_indices = torch.multinomial(top_k_probs, num_samples=1).squeeze(-1)
-            predictions = top_k_indices[range(top_k_indices.size(0)), sampled_indices]
-        elif strategy == "top_p":
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
-            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-            mask = cumulative_probs <= p
-            mask[:, 0] = True
-            sorted_probs[~mask] = 0
-            sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
-            sampled_indices = torch.multinomial(sorted_probs, num_samples=1).squeeze(-1)
-            predictions = sorted_indices[range(sorted_indices.size(0)), sampled_indices]
-        else:
-            raise ValueError(f"Unsupported strategy: {strategy}")
-            
-        return predictions
-    
-    def get_sequence_embedding_mean_pool(self, batch: Dict[str, Any]) -> torch.Tensor:
-        """
-        Get sequence-level embedding using mean pooling.
-        
-        Args:
-            batch: Input batch with sequence data
-            
-        Returns:
-            torch.Tensor: Sequence embeddings of shape [batch_size, d_model]
-        """
-        # Get hidden representations
-        hidden_states = self.forward(batch)  # [batch_size, seq_len, d_model]
-        
-        # Create mask for non-padding tokens (assuming 0 is padding)
-        if 'event' in batch:
-            padding_mask = (batch['event'] != 0).float()  # [batch_size, seq_len]
-        else:
-            # If no event key, assume no padding
-            padding_mask = torch.ones(hidden_states.shape[:2], device=hidden_states.device)
-        
-        # Apply mask and compute mean
-        masked_hidden = hidden_states * padding_mask.unsqueeze(-1)  # [batch_size, seq_len, d_model]
-        seq_lengths = padding_mask.sum(dim=1, keepdim=True)  # [batch_size, 1]
-        
-        # Avoid division by zero
-        seq_lengths = torch.clamp(seq_lengths, min=1.0)
-        
-        # Mean pooling
-        sequence_embedding = masked_hidden.sum(dim=1) / seq_lengths  # [batch_size, d_model]
-        
-        return sequence_embedding
-    
-    def get_sequence_embedding_attention_pool(self, batch: Dict[str, Any]) -> torch.Tensor:
-        """
-        Get sequence-level embedding using learned attention-weighted pooling.
-        
-        Args:
-            batch: Input batch with sequence data
-            
-        Returns:
-            torch.Tensor: Sequence embeddings of shape [batch_size, d_model]
-        """
-        # Get hidden representations
-        hidden_states = self.forward(batch)  # [batch_size, seq_len, d_model]
-        
-        # Initialize attention layer if not exists
-        if not hasattr(self, 'attention_pool'):
-            self.attention_pool = nn.Linear(self.hparams.d_model, 1, bias=False)
-            # Initialize with small weights
-            nn.init.normal_(self.attention_pool.weight, mean=0.0, std=0.02)
-            # Move to same device as the model
-            self.attention_pool = self.attention_pool.to(hidden_states.device)
-        
-        # Compute attention scores
-        attention_scores = self.attention_pool(hidden_states).squeeze(-1)  # [batch_size, seq_len]
-        
-        # Create mask for non-padding tokens
-        if 'event' in batch:
-            padding_mask = (batch['event'] != 0).float()  # [batch_size, seq_len]
-        else:
-            padding_mask = torch.ones(attention_scores.shape, device=hidden_states.device)
-        
-        # Apply mask to attention scores (set padding to very negative value)
-        masked_attention_scores = attention_scores.masked_fill(padding_mask == 0, -1e9)
-        
-        # Compute attention weights
-        attention_weights = torch.softmax(masked_attention_scores, dim=1)  # [batch_size, seq_len]
-        
-        # Apply attention weights
-        sequence_embedding = torch.sum(hidden_states * attention_weights.unsqueeze(-1), dim=1)  # [batch_size, d_model]
-        
-        return sequence_embedding, attention_weights
-    
-    def get_sequence_embedding_cls(self, batch: Dict[str, Any]) -> torch.Tensor:
-        """
-        Get sequence-level embedding using CLS token (first position).
-        
-        Args:
-            batch: Input batch with sequence data
-            
-        Returns:
-            torch.Tensor: Sequence embeddings of shape [batch_size, d_model]
-        """
-        # Get hidden representations
-        hidden_states = self.forward(batch)  # [batch_size, seq_len, d_model]
-        
-        # Use first position as sequence embedding (assuming CLS token)
-        sequence_embedding = hidden_states[:, 0, :]  # [batch_size, d_model]
-        
-        return sequence_embedding
-    
-    def get_sequence_embedding_max_pool(self, batch: Dict[str, Any]) -> torch.Tensor:
-        """
-        Get sequence-level embedding using max pooling.
-        
-        Args:
-            batch: Input batch with sequence data
-            
-        Returns:
-            torch.Tensor: Sequence embeddings of shape [batch_size, d_model]
-        """
-        # Get hidden representations
-        hidden_states = self.forward(batch)  # [batch_size, seq_len, d_model]
-        
-        # Create mask for non-padding tokens
-        if 'event' in batch:
-            padding_mask = (batch['event'] != 0).float()  # [batch_size, seq_len]
-        else:
-            padding_mask = torch.ones(hidden_states.shape[:2], device=hidden_states.device)
-        
-        # Apply mask (set padding to very negative value for max pooling)
-        masked_hidden = hidden_states.masked_fill(padding_mask.unsqueeze(-1) == 0, -1e9)
-        
-        # Max pooling
-        sequence_embedding, _ = torch.max(masked_hidden, dim=1)  # [batch_size, d_model]
-        
-        return sequence_embedding
-    
-    def compare_sequence_embeddings(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        """
-        Compare different sequence embedding methods.
-        
-        Args:
-            batch: Input batch with sequence data
-            
-        Returns:
-            Dict containing embeddings from different methods
-        """
-        embeddings = {}
-        
-        # Mean pooling
-        embeddings['mean_pool'] = self.get_sequence_embedding_mean_pool(batch)
-        
-        # Attention-weighted pooling
-        embeddings['attention_pool'], attention_weights = self.get_sequence_embedding_attention_pool(batch)
-        embeddings['attention_weights'] = attention_weights
-        
-        # CLS token
-        embeddings['cls'] = self.get_sequence_embedding_cls(batch)
-        
-        # Max pooling
-        embeddings['max_pool'] = self.get_sequence_embedding_max_pool(batch)
-        
-        return embeddings
-    
-    def get_logits_and_targets(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        """
-        Performs a forward pass and returns aligned logits and targets.
-
-        Args:
-            batch: A batch dictionary containing 'event' and other necessary keys.
-
-        Returns:
-            A dictionary containing:
-                - 'logits': Logits predicting the next token (shape: B, S-1, V).
-                - 'targets': Target token IDs (shape: B, S-1).
-                - 'inputs': Input token IDs used for prediction (shape: B, S-1).
-        """
-        # Ensure necessary keys are present
-        if 'event' not in batch:
-            raise ValueError("Batch dictionary must contain 'event' key.")
-
-        inputs = batch['event'][:, :-1].detach()  # Input: t0 to t(n-1)
-        targets = batch['event'][:, 1:].detach()   # Target: t1 to tn
-
-        # Check for valid sequence length
-        if inputs.shape[1] == 0 or targets.shape[1] == 0:
-             # Return empty tensors or raise error, depending on desired handling
-             # Returning empty tensors might be better for evaluation loop robustness
-             print(f"Warning: Sequence length <= 1 after slicing. Returning empty logits/targets.")
-             return {'logits': torch.empty(inputs.shape[0], 0, self.hparams.vocab_size, device=inputs.device),
-                     'targets': torch.empty_like(inputs),
-                     'inputs': torch.empty_like(inputs)}
-
-        # Forward pass using the base class method
-        # Ensure the forward method handles the full batch dictionary correctly
-        hidden_states = self.forward(batch) # Assumes forward uses the whole batch
-
-        # Get logits from decoder
-        logits = self.decoder(hidden_states) # Shape: (B, S, V)
-
-        # Align logits with targets
-        aligned_logits = logits[:, :targets.shape[1], :] # Shape: (B, S-1, V)
-
-        return {'logits': aligned_logits, 'targets': targets, 'inputs': inputs}
-
-    def evaluate_batch_perplexity_accuracy(
-        self,
-        batch: Dict[str, Any],
-        pad_token_id: int = 0,
-        return_token_loss: bool = False,
-    ) -> Dict[str, Any]:
-        """
-        Calculates loss, accuracy metrics for next-token prediction on a batch.
-        
-        Args:
-            batch: A batch dictionary.
-            pad_token_id: The ID of the padding token.
-            return_token_loss: Whether to return per-token losses
-            
-        Returns:
-            A dictionary containing metrics and optionally per-token losses
-        """
-        outputs = self.get_logits_and_targets(batch)
-        logits = outputs['logits']
-        targets = outputs['targets']
-
-        # Handle empty sequences returned by get_logits_and_targets
-        if targets.shape[1] == 0:
-            return {'batch_loss': 0.0, 'correct_preds': 0, 'total_tokens': 0,
-                    'predictions_flat': torch.empty(0, dtype=torch.long, device=targets.device),
-                    'targets_flat': torch.empty(0, dtype=torch.long, device=targets.device),
-                    'valid_mask_flat': torch.empty(0, dtype=torch.bool, device=targets.device)}
-
-        # Flatten for loss and accuracy calculation
-        logits_flat = logits.reshape(-1, logits.size(-1))  # (B * S', V)
-        targets_flat = targets.reshape(-1)                 # (B * S')
-
-        # Calculate per-token loss using cross entropy with reduction='none'
-        criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id, reduction='none')
-        per_token_loss = criterion(logits_flat, targets_flat)  # Shape: (B * S')
-
-        # Create mask for valid (non-padding) tokens
-        valid_mask_flat = (targets_flat != pad_token_id)
-
-        # Calculate total loss for the batch (sum over valid tokens)
-        batch_loss = per_token_loss[valid_mask_flat].sum().item()
-
-        # Calculate accuracy
-        predictions_flat = torch.argmax(logits_flat, dim=-1)
-        correct_preds_mask = (predictions_flat == targets_flat) & valid_mask_flat
-        correct_preds = correct_preds_mask.sum().item()
-        total_tokens = valid_mask_flat.sum().item()
-        
-        # Calculate per-sequence losses
-        batch_size = targets.size(0)
-        seq_length = targets.size(1)
-        
-        # Reshape per_token_loss to [batch_size, seq_length]
-        per_token_loss_reshaped = per_token_loss.reshape(batch_size, seq_length)
-        valid_mask_reshaped = valid_mask_flat.reshape(batch_size, seq_length)
-        
-        # Calculate per-sequence loss and token counts
-        sequence_losses = []
-        sequence_lengths = []
-        for i in range(batch_size):
-            seq_valid_mask = valid_mask_reshaped[i]
-            if seq_valid_mask.sum() > 0:
-                seq_loss = per_token_loss_reshaped[i][seq_valid_mask].sum().item()
-                seq_len = seq_valid_mask.sum().item()
-                sequence_losses.append(seq_loss)
-                sequence_lengths.append(seq_len)
-            else:
-                sequence_losses.append(0.0)
-                sequence_lengths.append(0)
-
-        if return_token_loss:
-            # Return per-token loss for further analysis if needed
-            return {
-                'batch_loss': batch_loss,
-                'correct_preds': correct_preds,
-                'total_tokens': total_tokens,
-                'predictions_flat': predictions_flat,
-                'targets_flat': targets_flat,
-                'valid_mask_flat': valid_mask_flat,
-                'per_token_loss': per_token_loss,
-                'token_losses': sequence_losses,
-                'sequence_lengths': sequence_lengths
-            }
-        else:
-            return {
-                'batch_loss': batch_loss,
-                'correct_preds': correct_preds,
-                'total_tokens': total_tokens,
-                'predictions_flat': predictions_flat,
-                'targets_flat': targets_flat,
-                'valid_mask_flat': valid_mask_flat
-            }
-
-    # generate_sequence and predict_step remain as they were
-
-    # (Optional) Add a method specifically for evaluating generated sequences
-    def evaluate_generated_sequence_perplexity(
-        self,
-        full_sequence_batch: Dict[str, Any], # Batch dict containing the FULL sequence (prompt+generated)
-        prompt_length: int,
-        pad_token_id: int = 0,
-        return_logits: bool = False,
-        ) -> Dict[str, float]:
-        """
-        Calculates the perplexity of the GENERATED part of sequences,
-        conditioned on the prompt.
-
-        Args:
-            full_sequence_batch: Batch dict w/ 'event' key shape (B, full_len)
-            prompt_length: The length of the initial prompt.
-            pad_token_id: The ID of the padding token.
-
-        Returns:
-            Dict containing 'generated_loss_sum' and 'generated_token_count'.
-        """
-        # Get logits for the full sequence (predicting token 1 to full_len)
-        # We need hidden states from position prompt_length-1 onwards
-        outputs = self.get_logits_and_targets(full_sequence_batch)
-        logits = outputs['logits'] # Shape (B, full_len - 1, V)
-
-        # Targets are the generated tokens (from index prompt_length to end)
-        targets = full_sequence_batch['event'][:, prompt_length:].detach() # Shape (B, generated_len)
-
-        # Logits corresponding to the generated targets start from index prompt_length-1
-        logits_for_generated = logits[:, prompt_length-1:, :] # Shape (B, generated_len, V)
-
-        # Check if shapes match
-        if logits_for_generated.shape[1] != targets.shape[1]:
-             print(f"Warning: Shape mismatch in evaluate_generated_sequence_perplexity. Logits: {logits_for_generated.shape[1]}, Targets: {targets.shape[1]}. Skipping calculation.")
-             return {'generated_loss_sum': 0.0, 'generated_token_count': 0}
-        if targets.shape[1] == 0: # No tokens were generated
-            return {'generated_loss_sum': 0.0, 'generated_token_count': 0}
-
-        # Flatten for loss calculation
-        logits_flat = logits_for_generated.reshape(-1, logits.size(-1))
-        targets_flat = targets.reshape(-1)
-
-        # Calculate per-token loss
-        per_token_loss = self.criterion(logits_flat, targets_flat)
-
-        # Mask out padding ONLY WITHIN THE GENERATED PART
-        valid_mask_flat = (targets_flat != pad_token_id)
-        batch_loss_sum = (per_token_loss * valid_mask_flat).sum().item()
-        valid_token_count = valid_mask_flat.sum().item()
-
-        if return_logits:
-            # Return logits for the generated part as well
-            return {
-                'generated_loss_sum': batch_loss_sum,
-                'generated_token_count': valid_token_count,
-                #'logits': logits_for_generated,  # Shape (B, generated_len, V)
-                #'targets': targets,               # Shape (B, generated_len)
-                'per_token_loss': per_token_loss, # Shape (B * generated_len)
-            }
-        else:
-            return {
-                'generated_loss_sum': batch_loss_sum,
-                'generated_token_count': valid_token_count
-                
-            }
-        
-    def compute_sequence_log_prob(self, batch):
-        """
-        Compute the log probability of each sequence in the batch.
-
-        Args:
-            batch (dict): Batch containing 'input_ids' (tensor of shape [batch_size, seq_len])
-                        and 'attention_mask' (tensor of shape [batch_size, seq_len]).
-
-        Returns:
-            Tensor: Log probabilities for each sequence, shape [batch_size].
-        """
-        if __debug__:
-            pdb.set_trace()
-        # Forward pass to get hidden states
-        hidden_states = self(batch)  # [batch_size, seq_len, hidden_size]
-        
-        # Get logits for all positions
-        logits = self.decoder(hidden_states)  # [batch_size, seq_len, vocab_size]
-        
-        # Compute log probabilities over the vocabulary
-        log_probs = F.log_softmax(logits, dim=-1)  # [batch_size, seq_len, vocab_size]
-        
-        # Extract input_ids and shift for targets
-        targets = batch['target']      # [batch_size, seq_len-1], tokens to predict
-        
-        # Gather log probabilities for the actual tokens (shifted by 1)
-        log_probs_per_token = log_probs[:, :, :].gather(
-            dim=-1, index=targets.unsqueeze(-1)
-        ).squeeze(-1)  # [batch_size, seq_len-1]
-        
-   
-        #Handle padding
-        dense_mask = (targets != 0).float()  # [64, 1023]
-    
-        # Sum log probabilities over valid positions
-        sequence_log_probs = (log_probs_per_token * dense_mask).sum(dim=-1)  # [64
-        # Sum log probabilities for valid positions
-        
-        return sequence_log_probs
-    
-
-
-#########
-#########
-
-
-#########
-#########
 
 class PretrainNanoEncoder(BaseNanoEncoder):
     def __init__(self, *args, **kwargs):
         super().__init__()
         self.save_hyperparameters()
-
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        self.metrics = FusedAccuracyAtK([1, 10, 100], reduce="sum")
+        self.metric_vals = {f"MLM top{key}": [] for key in self.metrics.top_k}
+        self.n_metric_vals = 0
+        self.criterion = FACrossEntropyLoss()
 
         self.decoder = nn.Linear(
             self.hparams.d_model, self.hparams.vocab_size, bias=False
@@ -1015,185 +200,686 @@ class PretrainNanoEncoder(BaseNanoEncoder):
             batch (Dict[str, Any]): Batch of data and targets.
             batch_idx (int): Batch index.
 
-        Returns: 
-            torch.Tensor: Loss value
-        """
-        # Forward pass
-        x = self.forward(batch)
-
-        # Decodes and reshapes
-        decoded_output = self.decoder(x)
-        decoded_output = decoded_output.view(-1, self.hparams["vocab_size"])
-
-        # Calculates MLM loss
-        loss = self.criterion(decoded_output, batch["target"].view(-1))
-
-        return loss, decoded_output
-
-
-class FinetuneNanoEncoder(BaseNanoEncoder):
-    """NanoEncoder adapted for binary classification (finetuning)"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-
-        self.metrics = {
-            "AUROC": AUROC("binary", ignore_index=-100),
-            "PRAUC": AveragePrecision("binary", ignore_index=-100),
-        }
-        self.validation_step_outputs = {"target": [], "preds": []}
-        self.decoder_finetune = nn.Linear(
-            self.hparams["d_model"], 1
-        )  # DON'T REUSE IDENTICAL DECODER NAME AS BASE `NANOENCODER`, AS THIS WILL BREAK LOADING OF CHECKPOINTS FROM PRETRAINED MODELS
-        self.criterion = torch.nn.BCEWithLogitsLoss()
-
-    def standard_step(
-        self, batch: Dict[str, Any], batch_idx: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Standard Binary Classification step.
-
-        Args:
-            batch (Dict[str, Any]): Batch of data and targets.
-            batch_idx (int): Batch index.
-
         Returns:
             torch.Tensor: Loss value
         """
         # Forward pass
-        x = self.forward(batch)
+        x = self.forward(batch, repad=False)
+
+        # Sparse token prediction
+        labels = batch["target"]
+        if -100 in labels:
+            mask_tokens = labels != -100
+            x = x[mask_tokens]
+            labels = labels[mask_tokens]
+        batch["labels"] = labels
 
         # Decodes and reshapes
-        cls = x[:, 0]
-        decoded_output = self.decoder_finetune(cls).view(-1)
-        loss = self.criterion(decoded_output, batch["target"].view(-1))
+        decoded_output = self.decoder(x)
+
+        # Calculates CE loss
+        loss = self.criterion(decoded_output, labels)
 
         return loss, decoded_output
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         loss, decoded_output = self.standard_step(batch, batch_idx)
-        self.log("val/loss", loss, sync_dist=True, batch_size=decoded_output.size(0))
+        self.log("val/loss", loss, sync_dist=True, batch_size=batch["event"].size(0))
 
         # Compute metrics
-        preds = torch.sigmoid(decoded_output).detach()
-        targets = batch["target"].view(-1).long().detach()
-        self.validation_step_outputs["target"].append(targets)
-        self.validation_step_outputs["preds"].append(preds)
+        logits = decoded_output.detach()
+        targets = batch["labels"].view(-1).detach()
+        res = self.metrics(logits, targets)
+        for k, val in res:
+            if isinstance(val, list):
+                self.metric_vals[f"MLM top{k}"].extend(val)
+            else:
+                self.metric_vals[f"MLM top{k}"].append(val)
+        self.n_metric_vals += len(logits)
 
         return loss
 
     def on_validation_epoch_end(self):
-        targets = torch.cat(self.validation_step_outputs["target"])
-        preds = torch.cat(self.validation_step_outputs["preds"])
-
-        for name, metric in self.metrics.items():
+        for name, metric in self.metric_vals.items():
             self.log(
                 name,
-                metric(preds, targets),
+                sum(metric) / self.n_metric_vals,
                 sync_dist=True,
             )
-
-        self.validation_step_outputs["target"].clear()
-        self.validation_step_outputs["preds"].clear()
-
-    def predict_step(self, batch: Dict[str, Any], batch_idx: int):
-        # Forward pass
-        x = self.forward(batch)
-
-        # Decodes and reshapes
-        cls = x[:, 0]
-        decoded_output = self.decoder_finetune(cls).view(-1)
-
-        # Return the prediction (outputs)
-        return decoded_output
+            self.metric_vals[name].clear()
+        self.n_metric_vals = 0
 
 
-class RiskNanoEncoder(FinetuneNanoEncoder):
-    """Extends Finetuning to work with Cumulative Risk Predictions"""
+
+class GenerativeNanoEncoder(PretrainNanoEncoder):
+    """Extends PretrainNanoEncoder with efficient generation capabilities"""
+    
+    def __init__(self, *args, max_generation_length=1024, extension_chunk_size=128, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_generation_length = max_generation_length
+        self.extension_chunk_size = extension_chunk_size
+        
+        # TODO: Add KV cache initialization here
+        # self.kv_cache = None  # Will store past key-value pairs
+        # self.cache_enabled = False
+    
+    def forward_generation(self, batch, use_autocast=True):
+        """
+        Forward pass specifically for generation with autocast support
+        
+        Args:
+            batch: Input batch in standard format
+            use_autocast: Whether to use CUDA autocast for mixed precision
+        """
+        device = batch['event'].device
+        should_autocast = (use_autocast and 
+                          device.type == 'cuda' and 
+                          hasattr(self, '_mixed_precision') and 
+                          self._mixed_precision)
+        
+        if should_autocast:
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                return self._forward_generation_impl(batch)
+        else:
+            return self._forward_generation_impl(batch)
+    
+    def _forward_generation_impl(self, batch):
+        """Implementation of generation forward pass"""
+        if 'cu_seqlens' in batch:
+            # Already unpacked (training format) - use parent's forward
+            return super().forward(batch, repad=True)
+        else:
+            # Standard format (generation) - need to unpack for Flash Attention
+            return self._unpack_and_forward_generation(batch)
+    
+    def _unpack_and_forward_generation(self, batch):
+        """Convert standard format to Flash Attention unpacked format and forward"""
+        from flash_attn.bert_padding import unpad_input, pad_input
+        
+        # Create attention mask if not present
+        if 'attn_mask' not in batch:
+            batch['attn_mask'] = (batch['event'] != 0)
+        
+        # Unpack the batch like the datamodule does
+        _, indices, cu_seqlens, max_seqlen_in_batch, total = unpad_input(
+            batch["event"].unsqueeze(-1), batch["attn_mask"]
+        )
+        
+        # Create unpacked batch
+        unpacked_batch = {
+            'event': batch["event"].flatten()[indices],
+            'abspos': batch["abspos"].flatten()[indices], 
+            'age': batch["age"].flatten()[indices],
+            'segment': batch["segment"].flatten()[indices],
+            'attn_mask': batch["attn_mask"],
+            'indices': indices,
+            'max_seqlen_in_batch': max_seqlen_in_batch,
+            'cu_seqlens': cu_seqlens,
+            'total': total.sum().item()
+        }
+        
+        # Forward through Flash Attention layers - generation-specific implementation
+        x = self.embed_information(unpacked_batch)
+        
+        # TODO: KV Cache - If we have past_key_values, only process new tokens
+        # if past_key_values is not None:
+        #     x = x[-total.sum().item():]  # Only new tokens
+        
+        x = self.transformer.drop(x)
+        
+        # TODO: KV Cache - Collect new key-values during forward pass
+        # new_key_values = []
+        
+        for i, block in enumerate(self.transformer.h):
+            # TODO: KV Cache - Pass and collect layer-specific cache
+            # layer_past = past_key_values[i] if past_key_values else None
+            # x, new_kv = block.forward_generation(x, unpacked_batch, past_key_values=layer_past, return_cache=True)
+            # new_key_values.append(new_kv)
+            
+            # Use the original block forward method for generation
+            x = block(x, unpacked_batch)
+        
+        x = self.transformer.ln_f(x)
+        
+        # Repad if requested
+        B = len(cu_seqlens) - 1
+        T = max_seqlen_in_batch
+        x = pad_input(x, indices, B, T)
+        
+        # TODO: KV Cache - Return both hidden states and new cache
+        # return x, new_key_values
+        return x
+    
+    def _ensure_batch_2d(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Ensure tensors are (B, T); if (T,) -> (1, T)."""
+        for key in ["event", "abspos", "age", "segment", "attn_mask"]:
+            if key in batch and torch.is_tensor(batch[key]) and batch[key].ndim == 1:
+                batch[key] = batch[key].unsqueeze(0)
+        return batch
+
+    
+    def embed_information(self, batch):
+        """
+        Embeds token + temporal/segment features with safe dtype handling for mixed precision.
+        Ensures all Time2Vec inputs match module parameter dtype (fp16/bf16) after model.half().
+        """
+        tok_dtype = self.embedding.weight.dtype
+        x = self.embedding(batch["event"])  # (B,T,D) in tok_dtype
+
+        abspos = batch["abspos"]
+        age = batch["age"]
+        segment = batch["segment"]
+
+        if abspos.dtype != tok_dtype:
+            abspos = abspos.to(tok_dtype)
+        if age.dtype != tok_dtype:
+            age = age.to(tok_dtype)
+
+        # Time2Vec modules were also cast by model.half(), so feed matching dtype
+        x = x + self.t2v_abspos(abspos)
+        x = x + self.t2v_age(age)
+        x = x + self.segment_embeddings(segment)  # segment indices ok (long) -> returns tok_dtype
+        return x
+
+    # Replace ONLY the use_cache branch inside generate() with this updated version (full generate function shown for clarity)
+
+    @torch.no_grad()
+    def generate(
+        self,
+        batch,
+        max_new_tokens=50,
+        temperature=1.0,
+        top_k=None,
+        top_p=None,
+        pad_token_id=0,
+        eos_token_id=None,
+        use_cache=False,
+        return_attention_mask=True,
+        use_autocast=True,
+        profile: bool = False,
+        debug: bool = False,
+        debug_steps: int = 3,
+        preallocate_cache: bool = True,   # NEW FLAG
+    ):
+        import os, time
+        debug = debug or os.environ.get("DEBUG_GEN") == "1"
+        def dprint(m): 
+            if debug: print(f"[GEN] {m}")
+
+        if 'cu_seqlens' in batch and 'indices' in batch:
+            batch = self._repack_batch(batch)
+        batch = self._ensure_batch_2d(batch)
+
+        if "attn_mask" not in batch or batch["attn_mask"].shape != batch["event"].shape:
+            batch["attn_mask"] = (batch["event"] != 0).to(batch["event"].device, torch.float32)
+
+        B, T0 = batch["event"].shape
+        device = batch["event"].device
+        model_dtype = self.embedding.weight.dtype
+
+        # Temporal tensors
+        def ensure(name, make_fn):
+            if name not in batch or batch[name].shape != (B, T0):
+                batch[name] = make_fn()
+        ensure("abspos", lambda: torch.arange(T0, device=device, dtype=model_dtype).unsqueeze(0).expand(B, -1))
+        ensure("age", lambda: torch.zeros(B, T0, dtype=model_dtype, device=device))
+        ensure("segment", lambda: torch.zeros(B, T0, dtype=torch.long, device=device))
+
+        # Cast continuous to model dtype
+        for k in ("abspos","age"):
+            if batch[k].dtype != model_dtype:
+                batch[k] = batch[k].to(model_dtype)
+
+        prompt_len = T0
+        if max_new_tokens <= 0:
+            out = {
+                "prompt": batch["event"],
+                "generated": batch["event"][:, 0:0],
+                "full": batch["event"],
+                "generation_lengths": torch.zeros(B, dtype=torch.long, device=device),
+                "finished": torch.zeros(B, dtype=torch.bool, device=device),
+                "prompt_length": prompt_len,
+            }
+            out["generated_events"] = out["generated"]
+            out["full_sequences"] = out["full"]
+            return out
+
+        # Preallocate sequence tensors
+        max_len = prompt_len + max_new_tokens
+        for k in ["event","abspos","age","segment","attn_mask"]:
+            need = max_len - batch[k].size(1)
+            if need > 0:
+                if k == "abspos":
+                    last = batch[k][:, -1:].to(model_dtype)
+                    incr = torch.arange(1, need+1, device=device, dtype=model_dtype)
+                    pad_block = (last + incr).expand(B, -1)
+                elif k == "age":
+                    pad_block = torch.zeros(B, need, dtype=model_dtype, device=device)
+                elif k == "segment":
+                    pad_block = batch[k][:, -1:].expand(B, need)
+                else:
+                    pad_block = torch.zeros(B, need, dtype=batch[k].dtype, device=device)
+                batch[k] = torch.cat([batch[k], pad_block], dim=1)
+
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+        generation_lengths = torch.zeros(B, dtype=torch.long, device=device)
+
+        if profile:
+            wall_start = time.perf_counter()
+            first_step_ms = None
+            decode_ms_acc = 0.0
+        else:
+            wall_start = first_step_ms = decode_ms_acc = None
+
+        # -------- NO CACHE PATH (unchanged) --------
+        if not use_cache:
+            current_length = prompt_len
+            for step in range(max_new_tokens):
+                cur = {k: (v[:, :current_length] if torch.is_tensor(v) and v.ndim==2 else v)
+                       for k,v in batch.items()}
+                if profile and device.type=="cuda":
+                    torch.cuda.synchronize(); t0=time.perf_counter()
+                if use_autocast and device.type=="cuda":
+                    with torch.autocast(device_type="cuda",
+                                        dtype=torch.float16 if getattr(self,"_mixed_precision",False) else torch.float32):
+                        hidden = self.forward_generation(cur, use_autocast=False)
+                else:
+                    hidden = self.forward_generation(cur, use_autocast=False)
+                if profile and device.type=="cuda":
+                    torch.cuda.synchronize()
+                    dt=(time.perf_counter()-t0)*1000
+                    if step==0: first_step_ms=dt
+                    else: decode_ms_acc += dt
+                last_pos = cur["attn_mask"].sum(1).long() - 1
+                last_hidden = hidden[torch.arange(B, device=device), last_pos]
+                if last_hidden.dtype != self.decoder.weight.dtype:
+                    last_hidden = last_hidden.to(self.decoder.weight.dtype)
+                logits = self.decoder(last_hidden).float()
+                next_tokens = self._sample_tokens(logits, temperature, top_k, top_p, finished)
+                if eos_token_id is not None:
+                    finished |= (next_tokens == eos_token_id)
+                generation_lengths[~finished] += 1
+                wp = current_length
+                batch["event"][:, wp] = torch.where(finished,
+                                                    torch.full_like(next_tokens, pad_token_id),
+                                                    next_tokens)
+                batch["attn_mask"][:, wp] = (~finished).to(batch["attn_mask"].dtype)
+                batch["abspos"][:, wp] = batch["abspos"][:, wp-1] + 1
+                batch["age"][:, wp] = batch["age"][:, wp-1]
+                batch["segment"][:, wp] = batch["segment"][:, wp-1]
+                current_length += 1
+                if finished.all(): break
+
+        # -------- CACHE PATH WITH PREALLOCATION --------
+        else:
+            prompt_batch = {
+                "event": batch["event"][:, :prompt_len],
+                "abspos": batch["abspos"][:, :prompt_len],
+                "age": batch["age"][:, :prompt_len],
+                "segment": batch["segment"][:, :prompt_len],
+                "attn_mask": batch["attn_mask"][:, :prompt_len],
+            }
+            x = self.embed_information(prompt_batch)  # (B,T,D)
+            caches = []
+            max_total_len = prompt_len + max_new_tokens
+            # Build prompt & preallocate per layer
+            for block in self.transformer.h:
+                if preallocate_cache:
+                    x, layer_cache = block.build_kv_cache_prealloc(x, prompt_batch["attn_mask"], max_total_len)
+                else:
+                    x, layer_cache = block.build_kv_cache(x, prompt_batch["attn_mask"])
+                caches.append(layer_cache)
+            x = self.transformer.ln_f(x)
+            last_hidden = x[:, -1:, :]
+            current_length = prompt_len
+
+            for step in range(max_new_tokens):
+                if profile and device.type=="cuda":
+                    torch.cuda.synchronize(); t0=time.perf_counter()
+
+                lh = last_hidden.squeeze(1)
+                if lh.dtype != self.decoder.weight.dtype:
+                    lh = lh.to(self.decoder.weight.dtype)
+                logits = self.decoder(lh).float()
+                next_tokens = self._sample_tokens(logits, temperature, top_k, top_p, finished)
+                if eos_token_id is not None:
+                    finished |= (next_tokens == eos_token_id)
+                generation_lengths[~finished] += 1
+
+                wp = current_length
+                if wp >= batch["event"].shape[1]: break
+                batch["event"][:, wp] = torch.where(finished,
+                                                    torch.full_like(next_tokens, pad_token_id),
+                                                    next_tokens)
+                batch["attn_mask"][:, wp] = (~finished).to(batch["attn_mask"].dtype)
+                batch["abspos"][:, wp] = batch["abspos"][:, wp-1] + 1
+                batch["age"][:, wp] = batch["age"][:, wp-1]
+                batch["segment"][:, wp] = batch["segment"][:, wp-1]
+
+                # New token embedding
+                token_embed = ( self.embedding(batch["event"][:, wp:wp+1])
+                                + self.t2v_abspos(batch["abspos"][:, wp:wp+1])
+                                + self.t2v_age(batch["age"][:, wp:wp+1])
+                                + self.segment_embeddings(batch["segment"][:, wp:wp+1]) )
+
+                new_token_hidden = token_embed
+                for li, block in enumerate(self.transformer.h):
+                    cache_li = caches[li]
+                    if preallocate_cache and len(cache_li) == 3:
+                        new_token_hidden, caches[li] = block.incremental_forward_prealloc(
+                            new_token_hidden, cache_li, position_index=wp
+                        )
+                    else:
+                        new_token_hidden, caches[li] = block.incremental_forward(
+                            new_token_hidden, cache_li, position_index=wp
+                        )
+                new_token_hidden = self.transformer.ln_f(new_token_hidden)
+                last_hidden = new_token_hidden
+
+                if profile and device.type=="cuda":
+                    torch.cuda.synchronize()
+                    dt=(time.perf_counter()-t0)*1000
+                    if step==0: first_step_ms=dt
+                    else: decode_ms_acc += dt
+
+                current_length += 1
+                if finished.all(): break
+
+        # ----- Final packaging -----
+        gen_len = int(generation_lengths.max().item())
+        final_len = prompt_len + gen_len
+        prompt_tokens = batch["event"][:, :prompt_len]
+        generated = batch["event"][:, prompt_len:final_len]
+        full_seq = batch["event"][:, :final_len]
+        out = {
+            "prompt": prompt_tokens,
+            "generated": generated,
+            "full": full_seq,
+            "generation_lengths": generation_lengths,
+            "finished": finished,
+            "prompt_length": prompt_len,
+        }
+        if return_attention_mask:
+            out["generated_attn_mask"] = batch["attn_mask"][:, :final_len]
+        out["generated_events"] = out["generated"]
+        out["full_sequences"] = out["full"]
+
+        if profile:
+            if device.type=="cuda": torch.cuda.synchronize()
+            total_ms = (time.perf_counter()-wall_start)*1000.0
+            gen_tokens_total = int(generation_lengths.sum().item())
+            prompt_tokens_total = int(batch["attn_mask"][:, :prompt_len].sum().item())
+            total_tokens = prompt_tokens_total + gen_tokens_total
+            out["profile"] = {
+                "batch_size": B,
+                "prompt_len": prompt_len,
+                "gen_tokens": gen_tokens_total,
+                "prompt_tokens": prompt_tokens_total,
+                "total_tokens": total_tokens,
+                "first_step_ms": first_step_ms,
+                "decode_ms": decode_ms_acc,
+                "total_ms": total_ms,
+                "tokens_per_sec_total": total_tokens / (total_ms/1000.0) if total_ms else 0.0,
+                "gen_tokens_per_sec": gen_tokens_total / (total_ms/1000.0) if total_ms else 0.0,
+                "decode_gen_tokens_per_sec": gen_tokens_total / (decode_ms_acc/1000.0) if decode_ms_acc else 0.0,
+                "used_cache": use_cache,
+                "preallocate_cache": preallocate_cache,
+            }
+        return out 
+    
+    def _repack_batch(self, batch):
+        """Convert unpacked Flash Attention format to standard format"""
+        from flash_attn.bert_padding import pad_input
+        
+        B = len(batch['cu_seqlens']) - 1
+        T = batch['max_seqlen_in_batch']
+        
+        repacked = {}
+        for key in ['event', 'abspos', 'age', 'segment']:
+            if key in batch:
+                if key == 'event':
+                    padded = pad_input(batch[key].unsqueeze(-1), batch['indices'], B, T)
+                    repacked[key] = padded.squeeze(-1)
+                else:
+                    padded = pad_input(batch[key].unsqueeze(-1), batch['indices'], B, T)
+                    repacked[key] = padded.squeeze(-1)
+        
+        repacked['attn_mask'] = (repacked['event'] != 0).float()
+        return repacked
+    
+    def _prepare_generation_tensors(self, batch, max_length):
+        """Pre-allocate tensors for efficient generation"""
+        batch_size, current_length = batch['event'].shape
+        device = batch['event'].device
+        
+        # Pre-allocate larger tensors
+        new_batch = {}
+        for key in ['event', 'segment']:
+            new_tensor = torch.zeros(batch_size, max_length, dtype=batch[key].dtype, device=device)
+            new_tensor[:, :current_length] = batch[key]
+            new_batch[key] = new_tensor
+        
+        for key in ['abspos', 'age', 'attn_mask']:
+            if key in batch:
+                new_tensor = torch.zeros(batch_size, max_length, dtype=batch[key].dtype, device=device)
+                new_tensor[:, :current_length] = batch[key]
+                new_batch[key] = new_tensor
+        
+        return new_batch
+    
+    def _get_current_batch(self, batch, current_length):
+        """Extract current sequence up to current_length"""
+        return {key: value[:, :current_length] for key, value in batch.items()}
+    
+
+    def _sample_tokens(self, logits, temperature, top_k, top_p, finished):
+        """Apply sampling to logits"""
+        batch_size = logits.shape[0]
+        device = logits.device
+        
+        # Apply temperature
+        if temperature != 1.0:
+            logits = logits / temperature
+        
+        # Apply top-k filtering
+        if top_k is not None:
+            top_k = min(top_k, logits.size(-1))
+            top_k_logits, _ = torch.topk(logits, top_k, dim=-1)
+            min_top_k = top_k_logits[:, -1:].expand_as(logits)
+            logits = torch.where(logits < min_top_k, 
+                               torch.full_like(logits, float('-inf')), 
+                               logits)
+        
+        # Apply top-p filtering
+        if top_p is not None and top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[:, 0] = False  # Keep at least one token
+            
+            indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
+            indices_to_remove.scatter_(1, sorted_indices, sorted_indices_to_remove)
+            logits = logits.masked_fill(indices_to_remove, float('-inf'))
+        
+        # Sample tokens
+        probs = F.softmax(logits, dim=-1)
+        
+        # Check for NaN or invalid probabilities
+        if torch.isnan(probs).any() or torch.isinf(probs).any():
+            # Use greedy sampling as fallback
+            next_tokens = torch.argmax(logits, dim=-1)
+        else:
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+        
+        # Use pad tokens for finished sequences
+        pad_token_id = 0  # Default pad token
+        next_tokens = torch.where(finished, 
+                                torch.full_like(next_tokens, pad_token_id), 
+                                next_tokens)
+        
+        return next_tokens
+    
+    def _extend_sequences(self, batch, next_tokens, current_length):
+        """Efficiently extend sequences with new tokens"""
+        batch_size = next_tokens.shape[0]
+        device = next_tokens.device
+        
+        # Add new events
+        batch['event'][:, current_length] = next_tokens
+        
+        # TODO: Improve temporal feature prediction
+        # For now, use simple heuristics for temporal features
+        if current_length > 0:
+            # Use last values + small increment for temporal continuity
+            batch['abspos'][:, current_length] = batch['abspos'][:, current_length-1] + 1.0
+            batch['age'][:, current_length] = batch['age'][:, current_length-1] + 0.1
+            batch['segment'][:, current_length] = batch['segment'][:, current_length-1]
+        else:
+            # Fallback values
+            batch['abspos'][:, current_length] = torch.zeros(batch_size, dtype=torch.float32, device=device)
+            batch['age'][:, current_length] = torch.zeros(batch_size, dtype=torch.float32, device=device) 
+            batch['segment'][:, current_length] = torch.ones(batch_size, dtype=torch.long, device=device)
+        
+        # Update attention mask
+        batch['attn_mask'][:, current_length] = 1.0
+        
+        return batch
+    
+    # TODO: Implement KV caching methods
+    # def _init_cache(self, batch_size, device):
+    #     """Initialize KV cache for all layers"""
+    #     cache = []
+    #     for _ in range(len(self.transformer.h)):
+    #         layer_cache = {
+    #             'key': None,
+    #             'value': None
+    #         }
+    #         cache.append(layer_cache)
+    #     return cache
+    #
+    # def _update_cache(self, past_cache, new_cache):
+    #     """Update KV cache with new key-value pairs"""
+    #     if past_cache is None:
+    #         return new_cache
+    #     
+    #     updated_cache = []
+    #     for past_layer, new_layer in zip(past_cache, new_cache):
+    #         updated_layer = {
+    #             'key': torch.cat([past_layer['key'], new_layer['key']], dim=-2),
+    #             'value': torch.cat([past_layer['value'], new_layer['value']], dim=-2)
+    #         }
+    #         updated_cache.append(updated_layer)
+    #     return updated_cache
+
+
+
+
+
+class PredictionFinetuneNanoEncoder(BaseNanoEncoder):
+    """Extends NanoEncoder to work with new FT scheme"""
 
     def __init__(self, *args, **kwargs):
         super().__init__()
 
-        num_follow_up = len(self.hparams.prediction_windows)
-        self.decoder_finetune = torch.nn.Linear(self.hparams.d_model, num_follow_up)
-        self.metrics = {
-            "AUROC": AUROC(
-                "multilabel",
-                ignore_index=-100,
-                num_labels=num_follow_up,
-                compute_on_cpu=True,
-                average="none",
-            ),
-            "PRAUC": AveragePrecision(
-                "multilabel",
-                ignore_index=-100,
-                num_labels=num_follow_up,
-                compute_on_cpu=True,
-                average="none",
-            ),
-        }
-        self.decoder_finetune = CumulativeProbabilityLayer(
-            self.hparams["d_model"], num_follow_up
+        self.decoder_finetune = torch.nn.Linear(
+            self.hparams.d_model, len(self.hparams.prediction_windows)
         )
-        self.criterion = torch.nn.BCEWithLogitsLoss(reduction="none")
+        self.metrics = [
+            CustomROCS(
+                pred_times=self.hparams.pred_times,
+                prediction_windows=self.hparams.prediction_windows,
+            ),
+            BestAtThreshold(
+                pred_times=self.hparams.pred_times,
+                prediction_windows=self.hparams.prediction_windows,
+            ),
+        ]
+        self.validation_step_outputs = {"target": [], "preds": []}
+        self.criterion = torch.nn.BCEWithLogitsLoss()
 
     def standard_step(
-        self, batch: Dict[str, Any], batch_idx: int
+        self, batch: Dict[str, Any], batch_idx: int, repad=True
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Standard Risk Trajectories step.
-
-        Args:
-            batch (Dict[str, Any]): Batch of data and targets.
-            batch_idx (int): Batch index.
-
-        Returns:
-            torch.Tensor: Loss value
-        """
-
         # Forward pass
-        x = self.forward(batch)
+        x = self.forward(batch, repad=repad)
         decoded_output = self.decoder_finetune(x)
 
-        event_mask = batch["event_mask"]
-        num_selected = event_mask.sum(dim=-1, keepdim=True)
-        decoded_output = torch.bmm(event_mask, decoded_output) / (num_selected + 1e-8)
+        predict_tokens = decoded_output[batch["predict_tokens"]].view(-1)
+        predict_targets = batch["target"][batch["target"] != -100]
+        loss = self.criterion(predict_tokens, predict_targets)
 
-        loss = self.criterion(decoded_output, batch["target"])
-        mask = batch["target"] != -100
-        loss = (loss * mask).sum() / mask.sum()  # loss = loss[mask].mean() (equivalent)
-
+        if repad:
+            decoded_output = torch.nn.utils.rnn.pad_sequence(
+                [
+                    row[mask]
+                    for row, mask in zip(decoded_output, batch["predict_tokens"])
+                ],
+                batch_first=True,
+                padding_side=(
+                    self.hparams.padding_side
+                    if self.hparams.get("padding_side")
+                    else "left"
+                ),
+                padding_value=torch.nan,
+            )
+        else:
+            decoded_output = predict_tokens
         return loss, decoded_output
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
-        loss, decoded_output = self.standard_step(batch, batch_idx)
+        loss, decoded_output = self.standard_step(batch, batch_idx, repad=True)
         self.log("val/loss", loss, sync_dist=True, batch_size=decoded_output.size(0))
 
         # Compute metrics
         preds = torch.sigmoid(decoded_output).detach().cpu()
         targets = batch["target"].long().detach().cpu()
+        if not self.hparams.pred_times:
+            targets = targets.view(-1, 1, targets.size(-1))
+            preds = preds.view(-1, 1, preds.size(-1))
         self.validation_step_outputs["target"].append(targets)
         self.validation_step_outputs["preds"].append(preds)
 
         return loss
 
     def on_validation_epoch_end(self):
-        targets = torch.cat(
-            [t.view(-1, t.size(-1)) for t in self.validation_step_outputs["target"]]
-        )
-        preds = torch.cat(
-            [p.view(-1, p.size(-1)) for p in self.validation_step_outputs["preds"]]
-        )
-        windows = self.hparams.prediction_windows
+        targets = torch.cat(self.validation_step_outputs["target"], dim=0)
+        preds = torch.cat(self.validation_step_outputs["preds"], dim=0)
 
-        for name, metric in self.metrics.items():
-            result = metric(preds, targets)
-            self.log(f"{name}_mean", result.mean(), sync_dist=True)
-            for i, res in enumerate(result):
-                self.log(f"{name}_interval {windows[i]}y", res, sync_dist=True)
+        for metric in self.metrics:
+            res = metric(preds, targets)
+            for name, metric in res.items():
+                self.log(name, metric, sync_dist=True)
 
         self.validation_step_outputs["target"].clear()
         self.validation_step_outputs["preds"].clear()
+
+    def predict_step(self, batch, batch_idx: int) -> torch.Tensor:
+        _, decoded_output = self.standard_step(batch, batch_idx)
+        # Compute metrics
+        preds = torch.sigmoid(decoded_output).detach().cpu()
+        targets = batch["target"].long().detach().cpu()
+        self.validation_step_outputs["target"].append(targets)
+        self.validation_step_outputs["preds"].append(preds)
+        return preds
+
+
+class RiskPredictionFinetuneNanoEncoder(PredictionFinetuneNanoEncoder):
+    """Extends Finetuning to work with Cumulative Risk Predictions"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+        self.metrics = [
+            CustomROCS(
+                pred_times=self.hparams.pred_times,
+                prediction_windows=self.hparams.prediction_windows,
+            )
+        ]
+
+        self.decoder_finetune = CumulativeProbabilityLayer(
+            self.hparams["d_model"], len(self.hparams.prediction_windows)
+        )
 
     def predict_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         _, decoded_output = self.standard_step(batch, batch_idx)
@@ -1208,40 +894,32 @@ class RiskNanoEncoder(FinetuneNanoEncoder):
         self.age_bracket_metrics()
 
     def age_bracket_metrics(self):
-        tbuckets = []
-        pbuckets = []
+        tbuckets, pbuckets = [], []
+        prediction_intervals = 20
+
         for tbatch, pbatch in zip(
             self.validation_step_outputs["target"],
             self.validation_step_outputs["preds"],
         ):
-            for i in range(0, len(tbatch[0]), 40):
-                b_idx = i // 40
+            for i in range(0, len(tbatch[0]), prediction_intervals):
+                b_idx = i // prediction_intervals
                 if len(tbuckets) <= b_idx:
                     tbuckets.append([])
                     pbuckets.append([])
-                tbuckets[b_idx].extend(tbatch[:, i : i + 40])
-                pbuckets[b_idx].extend(pbatch[:, i : i + 40])
-
+                tbuckets[b_idx].extend(tbatch[:, i : i + prediction_intervals])
+                pbuckets[b_idx].extend(pbatch[:, i : i + prediction_intervals])
         windows = self.hparams.prediction_windows
-        num_follow_up = len(self.hparams.prediction_windows)
         results = []
         valid_i = []
         for i, (targets, preds) in enumerate(zip(tbuckets, pbuckets)):
-            if (torch.cat(targets) == -100).all():
+            if len(targets) == 0 or (torch.cat(targets) == -100).all():
                 continue
             result = self.metrics["AUROC"](
-                torch.cat(preds).view(-1, num_follow_up),
-                torch.cat(targets).view(-1, num_follow_up),
+                torch.cat(preds).view(-1, len(windows)),
+                torch.cat(targets).view(-1, len(windows)),
             )
             if result.sum() == 0:
                 continue
-            # foo = torch.cat(targets)
-            # print(
-            #     i * 20,
-            #     i * 20 + 20,
-            #     (foo != -100).sum() / num_follow_up,
-            #     (foo != -100).sum() / (foo.size(0) * foo.size(1)),
-            # )
             results.append(result.tolist())
             valid_i.append(i)
         brackets = list(range(i))
@@ -1252,25 +930,30 @@ class RiskNanoEncoder(FinetuneNanoEncoder):
             columns=[f"{w}y" for w in windows],
             index=[f"{b}-{b+20}" for b in valid_brackets],
         ).T.round(3)
-        # print(df)
         self.logger.experiment.add_text(
             "Age brackets", df.to_markdown(), self.global_step
         )
 
 
-class ParentRiskNanoEncoder(RiskNanoEncoder):
+class FamilyRiskPredictionFinetuneNanoEncoder(RiskPredictionFinetuneNanoEncoder):
     def __init__(self, *args, **kwargs):
         super().__init__()
 
         self.typ_embeddings = nn.Embedding(4, self.hparams.d_model, padding_idx=0)
 
-        self.pos_embeddings = RotaryPositionalEmbeddings(
-            max_seq_len=self.hparams.max_seq_len * 3,
-            dim=self.hparams.d_model // self.hparams.num_heads,
-        )
-        self.segment_embeddings = nn.Embedding(
-            self.hparams.max_seq_len * 3, self.hparams.d_model, padding_idx=0
-        )
+    def embed_information(self, batch):
+        x = super().embed_information(batch)
+
+        x += self.typ_embeddings(batch["family_type"])
+
+        return x
+
+
+class FamilyPretrainNanoEncoder(PretrainNanoEncoder):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+        self.typ_embeddings = nn.Embedding(4, self.hparams.d_model, padding_idx=0)
 
     def embed_information(self, batch):
         x = super().embed_information(batch)

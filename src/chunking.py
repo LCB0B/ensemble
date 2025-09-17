@@ -1,13 +1,15 @@
 """ Functions responsible for creating in-memory chunks of big parquet files """
 
-from typing import Union, List
 from pathlib import Path
-from tqdm import tqdm
+from typing import List, Union
+
 import polars as pl
 import pyarrow as pa
-import pyarrow.parquet as pq
-import pyarrow.dataset as ds
 import pyarrow.compute as pc
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+from tqdm import tqdm
+
 from src.utils import get_pnrs
 
 
@@ -27,9 +29,33 @@ def yield_chunks(sources: Union[ds.Dataset, List[ds.Dataset]], chunk_size=100_00
             )
 
 
+def yield_chunks_given_pnrs(
+    sources: Union[ds.Dataset, List[ds.Dataset]], pnrs: List, chunk_size=500_000
+):
+    for i in tqdm(
+        range(0, len(pnrs), chunk_size), f"Yielding chunks of {chunk_size:_} pnrs"
+    ):
+        chunk_pnrs = pnrs[i : i + chunk_size]
+        if isinstance(sources, ds.Dataset):
+            yield get_chunk_given_pnrs(sources, chunk_pnrs)
+        elif isinstance(sources, list):
+            yield [get_chunk_given_pnrs(source, chunk_pnrs) for source in sources]
+        else:
+            raise ValueError(
+                f"Wrong typing {type(sources)}, only ds.Dataset or List[ds.Dataset]"
+            )
+
+
 def get_chunk(source: ds.Dataset, chunk_pnrs: List) -> pl.DataFrame:
     """Subsets source into a table using chunk_pnrs and converts to pl.DataFrame"""
     table = source.to_table(filter=pc.is_in(pc.field("person_id"), chunk_pnrs))
+    return pl.from_arrow(table)
+
+
+def get_chunk_given_pnrs(source: ds.Dataset, chunk_pnrs: List) -> pl.DataFrame:
+    table = source.to_table(
+        filter=pc.is_in(pc.field("person_id"), pa.array(chunk_pnrs))
+    )
     return pl.from_arrow(table)
 
 

@@ -1,17 +1,20 @@
 """ File for tokenization and event creation """
 
 import json
-from typing import List
 from pathlib import Path
+from typing import List
+
 import polars as pl
 import pyarrow.dataset as ds
 
-from src.tokenize import create_vocab
-from src.utils import get_pnrs, print_main
 from src.features import (
     create_cls_source,
     create_tokenized_events,
 )
+from src.paths import FPATH
+from src.tokenize import create_vocab
+from src.utils import get_pnrs, print_main
+from src.log_data import create_data_creation_directory, setup_data_creation_logger
 
 
 class DataPipeline:
@@ -24,26 +27,48 @@ class DataPipeline:
         fill_nulls: bool = False,
         subset_background: bool = False,
         cutoff: int = 0,
+        time_encoding: str = "time2vec",
+        enable_logging: bool = True,
     ):
         self.cls_token = cls_token
         self.sep_token = sep_token
         self.fill_nulls = fill_nulls
         self.subset_background = subset_background
         self.cutoff = cutoff
+        self.time_encoding = time_encoding
+        self.enable_logging = enable_logging
 
         # Assigned during __call__
         self.dir_path = None
+        self.source_dir = None
         self.vocab = None
+        self.log_dir = None
+        self.logger = None
 
     def __call__(
-        self, sources: List[ds.Dataset], background: pl.DataFrame, dir_path: Path = None
+        self,
+        sources: List[ds.Dataset],
+        background: pl.DataFrame,
+        dir_path: Path = None,
+        source_dir: Path = None,
     ):
         """Does all data processing required to create features"""
         assert {"person_id", "date_col"}.issubset(
             background.columns
         ), "Required cols: person_id, date_col"
         self.dir_path = dir_path
+        self.source_dir = source_dir
 
+        # Setup logging if enabled
+        if self.enable_logging:
+            # Convert to Path objects if they're strings
+            source_dir_path = Path(source_dir) if isinstance(source_dir, str) else source_dir
+            dir_path_path = Path(dir_path) if isinstance(dir_path, str) else dir_path
+
+            dataset_name = f"{source_dir_path.name}_{dir_path_path.name}" if source_dir_path and dir_path_path else "dataset"
+            self.log_dir = create_data_creation_directory(dataset_name)
+            self.logger = setup_data_creation_logger(self.log_dir, dataset_name)
+            self.logger.info(f"Starting data processing with time_encoding={self.time_encoding}")
         # Subset background on sources
         if self.subset_background:
             background = self.get_background_subset(sources, background)
@@ -122,27 +147,50 @@ class DataPipeline:
         vocab_path = self.dir_path / "vocab.json"
 
         if (vocab := self._load_if_exists(vocab_path)) is None:
-            vocab = create_vocab(sources, cutoff=self.cutoff)
+            vocab = create_vocab(sources, cutoff=self.cutoff, time_encoding=self.time_encoding)
             with open(vocab_path, "w", encoding="utf-8") as f:
                 json.dump(vocab, f)
+
+            # Log vocabulary creation
+            if self.logger:
+                self.logger.info(f"Created vocabulary with {len(vocab)} tokens using {self.time_encoding} encoding")
         return vocab
 
     def get_tokenized_event(
         self, sources: List[ds.Dataset], vocab: dict, birthdates: pl.DataFrame
     ) -> ds.Dataset:
         """Load or create the tokenized event dataframe"""
-
-        tokenized_path = self.dir_path / "tokenized.parquet"
-
+        # Tokenize parquet is moved to network to conserve space on local IO
+        tokenized_path_local = self.dir_path / "tokenized.parquet"
+        tokenized_path_network = (
+            FPATH.NETWORK_DATA
+            / self.source_dir
+            / f"{self.dir_path.name}_tokenized.parquet"
+        )
+        # Load first from network IO
         if (
-            tokenized_event := self._load_if_exists(tokenized_path, backend="arrow")
+            tokenized_event := self._load_if_exists(
+                tokenized_path_network, backend="arrow"
+            )
         ) is None:
-            tokenized_event = create_tokenized_events(
-                sources=sources,
-                vocab=vocab,
-                birthdates=birthdates,
-                sep_token=self.sep_token,
-                dir_path=self.dir_path,
-                fill_nulls=self.fill_nulls,
-            )  # tokenized_event is saved within create_tokenized_events function
+            # Load from local io (backwards compatibility)
+            if (
+                tokenized_event := self._load_if_exists(
+                    tokenized_path_local, backend="arrow"
+                )
+            ) is None:
+                tokenized_event = create_tokenized_events(
+                    sources=sources,
+                    vocab=vocab,
+                    birthdates=birthdates,
+                    sep_token=self.sep_token,
+                    dir_path=self.dir_path,
+                    fill_nulls=self.fill_nulls,
+                    time_encoding=self.time_encoding,
+                    log_dir=self.log_dir,
+                )  # tokenized_event is saved within create_tokenized_events function
+
+                # Log tokenized event creation
+                if self.logger:
+                    self.logger.info(f"Created tokenized events with {self.time_encoding} encoding")
         return tokenized_event

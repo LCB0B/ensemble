@@ -4,7 +4,8 @@ import torch
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 
-#@torch.compiler.disable
+
+# @torch.compiler.disable
 class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
     def __init__(self, optimizer, warmup, max_iters):
         self.warmup = warmup
@@ -23,7 +24,6 @@ class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
         if step >= self.max_iters:
             lr_factor = 0
         return lr_factor
-    
 
 
 class TensorCosineWarmupScheduler(_LRScheduler):
@@ -63,11 +63,10 @@ class TensorCosineWarmupScheduler(_LRScheduler):
         step = torch.tensor(step, dtype=torch.float32)
         pi = torch.acos(torch.zeros(1)) * 2  # Calculate π using torch
         lr_factor = 0.5 * (1 + torch.cos(pi * step / self.max_iters))
-        
+
         if step <= self.warmup and self.warmup > 0:
             lr_factor *= step / self.warmup
         if step >= self.max_iters:
             lr_factor = torch.tensor(0.0, dtype=torch.float32)
-        
-        return lr_factor
 
+        return lr_factor

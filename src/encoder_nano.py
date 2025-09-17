@@ -8,17 +8,26 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 """
 
 import math
-from typing import Dict, Any, Tuple
+from typing import Any, Dict, Tuple
+
+import lightning.pytorch as pl
+import torch
+import torch.nn as nn
+from flash_attn.bert_padding import pad_input, unpad_input
+from flash_attn.losses.cross_entropy import CrossEntropyLoss
+from torch.nn.attention.flex_attention import create_block_mask
+from torch.optim.lr_scheduler import (
+    ChainedScheduler,
+    CosineAnnealingLR,
+    LinearLR,
+    SequentialLR,
+)
+from torchmetrics import AUROC, AveragePrecision
+
+from src.encoder_blocks import Block
 from src.lr_schedulers import CosineWarmupScheduler
 from src.time2vec import Time2Vec
 from src.utils import print_main
-from src.encoder_blocks import Block
-from src.utils import flex_attn_padding
-import torch
-import torch.nn as nn
-import lightning.pytorch as pl
-from torchmetrics import AUROC, AveragePrecision
-from torch.nn.attention.flex_attention import create_block_mask
 
 
 class BaseNanoEncoder(pl.LightningModule):
@@ -26,12 +35,6 @@ class BaseNanoEncoder(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        # self.t2v_abspos = Time2Vec(
-        #     output_dim=self.hparams.d_model,
-        #     clip_min=-100,
-        #     clip_max=100,
-        #     init_scale=1e-4,
-        # )
         self.t2v_age = Time2Vec(
             output_dim=self.hparams.d_model,
             clip_min=-100,
@@ -41,19 +44,23 @@ class BaseNanoEncoder(pl.LightningModule):
         self.embedding = nn.Embedding(
             self.hparams.vocab_size, self.hparams.d_model, padding_idx=0
         )
+
+        self.segment_embeddings = nn.Embedding(
+            self.hparams.max_seq_len // 2, self.hparams.d_model, padding_idx=0
+        )
+
         self.transformer = nn.ModuleDict(
             dict(
                 drop=nn.Dropout(self.hparams.dropout),
                 h=nn.ModuleList(
                     [
                         Block(
-                            self.hparams.d_model,
-                            self.hparams.num_heads,
-                            self.hparams.dropout,
-                            self.hparams.bias,
-                            self.hparams.dim_feedforward,
-                            self.hparams.compile,
-                            self.hparams.swiglu,
+                            d_model=self.hparams.d_model,
+                            num_heads=self.hparams.num_heads,
+                            dropout=self.hparams.dropout,
+                            bias=self.hparams.bias,
+                            max_seq_len=self.hparams.max_seq_len,
+                            causal=self.hparams.causal,
                         )
                         for _ in range(self.hparams.num_layers)
                     ]
@@ -61,7 +68,6 @@ class BaseNanoEncoder(pl.LightningModule):
                 ln_f=torch.nn.LayerNorm(self.hparams.d_model, bias=self.hparams.bias),
             )
         )
-
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -79,48 +85,41 @@ class BaseNanoEncoder(pl.LightningModule):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def embed_information(self, batch):
+        """Embeds information using available keys"""
+
+        x = self.embedding(batch["event"])
+        x += self.t2v_age(batch["age"])
+        x += self.segment_embeddings(batch["segment"])
+
+        return x
+
+    @torch.compile(dynamic=True)
     def forward(self, batch: Dict[str, Any]):
-        x, mask, abspos, age = (
-            batch["event"],
-            batch["last_data_idx"],
-            batch["abspos"],
-            batch["age"],
-        )
-        x = self.embedding(x)
+        B, T = batch["attn_mask"].shape
 
-        if self.hparams["collate_method"] == "flatten_and_expand":
-            # Create block mask
-            attn_mask = create_block_mask(
-                flex_attn_padding(batch["last_data_idx"]),
-                x.size(0),
-                None,
-                x.size(1),
-                x.size(1),
-                _compile=True,
-            )
-
-        elif self.hparams["collate_method"] == "channel":
-            x *= mask.unsqueeze(-1)  # (B, L, C) -> (B, L, C, 1)
-            x = x.sum(dim=2)  # (B, L, C, D) -> (B, L, D)
-
-            denom = mask.sum(
-                dim=2, keepdim=True
-            )  # Amount of relevant channels which are present
-            x /= denom + 0.0001  # Divide with amount of non-zero channels
-
-            attn_mask = mask[:, :, 0]
-
-        # x += self.t2v_abspos(abspos)  # Add positional encoding
-        x += self.t2v_age(age)  # Add positional encoding
+        x = self.embed_information(batch)
 
         # forward the GPT model itself
         x = self.transformer.drop(x)
         for block in self.transformer.h:
-            x = block(x, attn_mask)
+            x = block(x, batch)
         x = self.transformer.ln_f(x)
 
+        # Repad
+        if x.ndim == 2:
+            x = pad_input(x, batch["indices"], B, T)
         return x
 
+    @staticmethod
+    def pad_to_multiple(x, n_tokens):
+        total = x.size(0)
+        padding_len = n_tokens - total
+        if padding_len == 0:
+            return x
+        return torch.cat((x, torch.zeros((padding_len, x.size(1)), device=x.device)))
+
+    @torch.compile(dynamic=False)
     def standard_step(
         self, batch: Dict[str, Any], batch_idx: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -150,7 +149,7 @@ class BaseNanoEncoder(pl.LightningModule):
 
         optimizer = torch.optim.AdamW(
             optim_groups,
-            lr=self.hparams.learning_rate,
+            lr=torch.tensor(self.hparams.learning_rate),
             betas=(self.hparams.beta1, self.hparams.beta2),
             fused=True,
         )
@@ -158,13 +157,11 @@ class BaseNanoEncoder(pl.LightningModule):
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
-                "scheduler": CosineWarmupScheduler(
+                "scheduler": LinearLR(
                     optimizer,
-                    warmup=int(
-                        self.hparams["steps_per_epoch"]
-                        * self.hparams["optimizer_warmup_epochs"]
-                    ),
-                    max_iters=self.hparams.optimizer_max_iters,
+                    start_factor=1e-4,
+                    end_factor=1,
+                    total_iters=int(self.hparams["warmup_steps"]),
                 ),
                 "interval": "step",
                 "frequency": 1,
@@ -172,83 +169,8 @@ class BaseNanoEncoder(pl.LightningModule):
             },
         }
 
-    @torch.compiler.disable()
     def log(self, *args, **kwargs):
         return super().log(*args, **kwargs)
-
-class CausalNanoEncoder(BaseNanoEncoder):
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
-
-        if self.hparams.collate_method == "flatten_and_expand":
-            self.decoder = nn.Linear(
-                self.hparams.d_model, self.hparams.vocab_size, bias=False
-            )
-            # Tie weights for efficient parameter sharing
-            if self.embedding.weight.shape == self.decoder.weight.shape:
-                self.embedding.weight = self.decoder.weight
-        elif self.hparams.collate_method == "channel":
-            self.decoder = nn.Linear(
-                self.hparams.d_model, self.hparams.vocab_size * 9, bias=False
-            )
-        else:
-            raise ValueError(
-                f"Unknown collate_method given: {self.hparams.collate_method}"
-            )
-
-    def standard_step(
-        self, batch: Dict[str, Any], batch_idx: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Standard causal prediction step (next-block prediction).
-
-        Args:
-            batch (Dict[str, Any]): Batch of data and targets.
-            batch_idx (int): Batch index.
-
-        Returns:
-            torch.Tensor: Loss value
-        """
-        # Forward pass
-        x = self.forward(batch)
-
-        # Handle flex attention block prediction
-        if self.hparams["collate_method"] == "flatten_and_expand":
-            # Create block mask for causal prediction
-            attn_mask = create_block_mask(
-                flex_attn_padding(batch["last_data_idx"]),
-                x.size(0),
-                None,
-                x.size(1),
-                x.size(1),
-                causal=True,  # Enable causal masking
-                _compile=True,
-            )
-            # Apply causal masking
-            for block in self.transformer.h:
-                x = block(x, attn_mask)
-
-        # Decodes and reshapes
-        decoded_output = self.decoder(x)
-        decoded_output = decoded_output.view(-1, self.hparams["vocab_size"])
-
-        # Calculates next-block prediction loss
-        loss = self.criterion(decoded_output, batch["target"].view(-1))
-
-        return loss, decoded_output
-
-    def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
-        loss, _ = self.standard_step(batch, batch_idx)
-        self.log("train/loss", loss)
-        return loss
-
-    def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
-        loss, _ = self.standard_step(batch, batch_idx)
-        self.log("val/loss", loss, sync_dist=True)
-        return loss
 
 
 class PretrainNanoEncoder(BaseNanoEncoder):
@@ -256,24 +178,16 @@ class PretrainNanoEncoder(BaseNanoEncoder):
         super().__init__()
         self.save_hyperparameters()
 
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        # Use triton cross_entropy_loss
+        # self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        self.criterion = CrossEntropyLoss(ignore_index=-100)
 
-        if self.hparams.collate_method == "flatten_and_expand":
-            self.decoder = nn.Linear(
-                self.hparams.d_model, self.hparams.vocab_size, bias=False
-            )
-            # TODO: Does this overwrite the embedding when loading a finetuned model?
-            # Tie weights (https://paperswithcode.com/method/weight-tying)
-            if self.embedding.weight.shape == self.decoder.weight.shape:
-                self.embedding.weight = self.decoder.weight
-        elif self.hparams.collate_method == "channel":
-            self.decoder = nn.Linear(
-                self.hparams.d_model, self.hparams.vocab_size * 9, bias=False
-            )
-        else:
-            raise ValueError(
-                f"Unknown collate_method given: {self.hparams.collate_method}"
-            )
+        self.decoder = nn.Linear(
+            self.hparams.d_model, self.hparams.vocab_size, bias=False
+        )
+        # Tie weights (https://paperswithcode.com/method/weight-tying)
+        if self.embedding.weight.shape == self.decoder.weight.shape:
+            self.embedding.weight = self.decoder.weight
 
     def standard_step(
         self, batch: Dict[str, Any], batch_idx: int
@@ -291,12 +205,21 @@ class PretrainNanoEncoder(BaseNanoEncoder):
         # Forward pass
         x = self.forward(batch)
 
+        # Sparse token prediction
+        labels = batch["target"].view(-1)
+        last_hidden_state = x.view(labels.shape[0], -1)
+        # filter out the non-masked tokens
+        mask_tokens = labels != -100
+        last_hidden_state = last_hidden_state[mask_tokens]
+        labels = labels[mask_tokens]
+        batch["labels"] = labels
+
         # Decodes and reshapes
-        decoded_output = self.decoder(x)
+        decoded_output = self.decoder(last_hidden_state)
         decoded_output = decoded_output.view(-1, self.hparams["vocab_size"])
 
         # Calculates MLM loss
-        loss = self.criterion(decoded_output, batch["target"].view(-1))
+        loss = self.criterion(decoded_output, labels)
 
         return loss, decoded_output
 
@@ -308,7 +231,9 @@ class PretrainNanoEncoder(BaseNanoEncoder):
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         loss, _ = self.standard_step(batch, batch_idx)
-        self.log("val/loss", loss, sync_dist=True)
+        self.log(
+            "val/loss", loss, sync_dist=True, batch_size=batch["attn_mask"].shape[0]
+        )
 
         return loss
 
@@ -324,9 +249,22 @@ class FinetuneNanoEncoder(BaseNanoEncoder):
             "PRAUC": AveragePrecision("binary"),
         }
         self.validation_step_outputs = {"target": [], "preds": []}
-        self.decoder_finetune = nn.Linear(
-            self.hparams["d_model"], 1
-        )  # DON'T REUSE IDENTICAL DECODER NAME AS BASE `NANOENCODER`, AS THIS WILL BREAK LOADING OF CHECKPOINTS FROM PRETRAINED MODELS
+
+        # DON'T REUSE IDENTICAL DECODER NAME AS BASE `NANOENCODER`, AS THIS WILL BREAK LOADING OF CHECKPOINTS FROM PRETRAINED MODELS
+        # Define the BIGRU decoder with an output layer for binary classification
+        self.decoder_finetune = nn.GRU(
+            input_size=self.hparams["d_model"],
+            hidden_size=self.hparams["d_model"],
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.output_layer = nn.Linear(
+            self.hparams["d_model"] * 2, 1
+        )  # *2 for bidirectional
+
+        ## Mean pooling version
+        # self.decoder_finetune = nn.Linear(self.hparams["d_model"], 1)
         self.criterion = torch.nn.BCEWithLogitsLoss()
 
     def standard_step(
@@ -345,13 +283,40 @@ class FinetuneNanoEncoder(BaseNanoEncoder):
         # Forward pass
         x = self.forward(batch)
 
-        # Decodes and reshapes
-        cls = x[:, 0]
-        decoded_output = self.decoder_finetune(cls).view(-1)
+        # Pass through the BIGRU decoder
+        gru_output, _ = self.decoder_finetune(x)
+        final_hidden_states = gru_output[:, 0, :].squeeze(1)
 
-        loss = self.criterion(
-            decoded_output, batch["target"].view(-1).to(torch.float32)
+        # Get dimensions and define forward hidden size
+        hidden_size = gru_output.size(-1)
+        forward_hidden_size = hidden_size // 2  # for each direction
+
+        # Use mask to select the final hidden state for each sequence in both directions
+        last_indices = (
+            batch["sequence_lens"].view(-1, 1, 1).expand(-1, 1, forward_hidden_size)
+        ).to(torch.int64)
+
+        # Forward final state (from sequence_lens)
+        forward_final_states = torch.gather(
+            gru_output[:, :, :forward_hidden_size], 1, last_indices - 1
+        ).squeeze(1)
+
+        # Backward final state (from 0th index)
+        backward_final_states = gru_output[:, 0, forward_hidden_size:].squeeze(1)
+
+        # Concatenate forward and backward final states
+        final_hidden_states = torch.cat(
+            (forward_final_states, backward_final_states), dim=-1
         )
+
+        # Pass through the output layer for binary classification
+        decoded_output = self.output_layer(final_hidden_states).view(-1)
+
+        ## Mean pooling version
+        # decoded_output = self.decoder_finetune(x.mean(dim=1)).view(-1)
+
+        # Calculate binary classification loss
+        loss = self.criterion(decoded_output, batch["target"].view(-1))
 
         return loss, decoded_output
 
@@ -364,7 +329,7 @@ class FinetuneNanoEncoder(BaseNanoEncoder):
     def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         loss, decoded_output = self.standard_step(batch, batch_idx)
         self.log(
-            "val/loss", loss, sync_dist=True, batch_size=self.hparams["batch_size"]
+            "val/loss", loss, sync_dist=True, batch_size=batch["attn_mask"].shape[0]
         )
 
         # Compute metrics
@@ -384,7 +349,6 @@ class FinetuneNanoEncoder(BaseNanoEncoder):
                     name,
                     metric(preds, targets),
                     sync_dist=True,
-                    batch_size=self.hparams["batch_size"],
                 )
             except ValueError as e:  # If targets only contain 1 class
                 print_main("Metric check error:", e)
@@ -394,13 +358,38 @@ class FinetuneNanoEncoder(BaseNanoEncoder):
 
     def predict_step(self, batch: Dict[str, Any], batch_idx: int):
         # Forward pass
-        # print(batch['event'].shape)
-        # print(batch.keys())
         x = self.forward(batch)
 
-        # Decodes and reshapes
-        cls = x[:, 0]
-        decoded_output = self.decoder_finetune(cls).view(-1)
+        # Pass through the BIGRU decoder
+        gru_output, _ = self.decoder_finetune(x)
+
+        # Get dimensions and define forward hidden size
+        hidden_size = gru_output.size(-1)
+        forward_hidden_size = hidden_size // 2  # for each direction
+
+        # Use mask to select the final hidden state for each sequence in both directions
+        last_indices = (
+            batch["sequence_lens"].view(-1, 1, 1).expand(-1, 1, forward_hidden_size)
+        ).to(torch.int64)
+
+        # Forward final state (from sequence_lens)
+        forward_final_states = torch.gather(
+            gru_output[:, :, :forward_hidden_size], 1, last_indices - 1
+        ).squeeze(1)
+
+        # Backward final state (from 0th index)
+        backward_final_states = gru_output[:, 0, forward_hidden_size:].squeeze(1)
+
+        # Concatenate forward and backward final states
+        final_hidden_states = torch.cat(
+            (forward_final_states, backward_final_states), dim=-1
+        )
+
+        # Pass through the output layer for binary classification
+        decoded_output = self.output_layer(final_hidden_states).view(-1)
+
+        ## Mean pooling version
+        # decoded_output = self.decoder_finetune(x.mean(dim=1)).view(-1)
 
         preds = torch.sigmoid(decoded_output).detach()
         return preds

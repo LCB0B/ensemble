@@ -2,14 +2,15 @@
 
 from pathlib import Path
 from typing import Optional
+
+import oracledb
 import pandas as pd
 import polars as pl
-import oracledb
 import pyarrow as pa
 import pyarrow.parquet as pq
-
+from sqlalchemy import create_engine
+from sqlalchemy import text as sql_text
 from tqdm import tqdm
-from sqlalchemy import create_engine, text as sql_text
 
 from src.paths import FPATH
 
@@ -20,6 +21,7 @@ def execute_query_to_single_parquet_file(
     filepath: Path,
     schema: Optional[str] = None,
     chunk_size: int = 50_000_000,
+    convert_ints_to_floats: bool = False,
 ) -> None:
     """
     Executes a SQL query on a specified database and saves the results in multiple Parquet files,
@@ -28,10 +30,12 @@ def execute_query_to_single_parquet_file(
     Args:
         database (str): The name of the database to connect to.
         sql_script (str): The SQL script to execute.
-        fname (str): The base folder name where Parquet files will be stored.
+        filepath (Path): The path where the Parquet file will be stored.
         schema (Optional[str]): The schema to use within the database. Defaults to None.
         chunk_size (int): The number of rows per chunk for splitting the SQL output.
             Defaults to 50,000,000.
+        convert_ints_to_floats (bool): Whether to convert integer columns to float to avoid type mismatches.
+            Defaults to False.
     """
     oracledb.init_oracle_client()
 
@@ -46,12 +50,16 @@ def execute_query_to_single_parquet_file(
     writer = None
 
     # save to parquet in chunks
+    schema = None
     with engine.connect() as connection:
         for df in tqdm(pd.read_sql(sql_script, con=connection, chunksize=chunk_size)):
-            table = pa.Table.from_pandas(df)
+            table = pa.Table.from_pandas(df, schema=schema)
+            del df
             if writer is None:
                 writer = pq.ParquetWriter(filepath, schema=table.schema)
+                schema = table.schema
             writer.write_table(table)
+            del table
 
     writer.close()
 

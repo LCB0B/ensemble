@@ -1,54 +1,95 @@
-import numpy as np
-import torch
-from torch.utils.data import DataLoader
-from sklearn.metrics import roc_auc_score
-from src.paths import FPATH, copy_file_or_dir
-from scipy.sparse import load_npz
+import warnings
+from pathlib import Path
+
+import hydra
 import joblib
-from src.tabular_models import LogisticRegression, SparseDataset
+import numpy as np
 import pytorch_lightning as pl
+import torch
+from omegaconf import DictConfig
+from scipy.sparse import load_npz
+from sklearn.metrics import roc_auc_score
+from torch.utils.data import DataLoader
+
+from src.earlylife.src.paths import FPATH
+from src.earlylife.src.tabular_models import LogisticRegression, SparseDataset
 
 torch.set_float32_matmul_precision("medium")
 
+warnings.filterwarnings(
+    "ignore",
+    message=".*You are using `torch.load` with `weights_only=False`.*",
+    module="lightning_fabric.utilities.cloud_io",
+)
 
-if __name__ == "__main__":
-    # Load the saved Optuna study and retrieve the best hyperparameters and model path
 
-    data_split = "val" # test or val
-    experiment = "LR5"
-    print(f"Doing inference for experiment {experiment} datasplit {data_split}")
+@hydra.main(
+    config_path=(FPATH.CONFIGS / "tabular").as_posix(),
+    config_name="logistic_regression_inference.yaml",
+    version_base=None,
+)
+def main(hparams: DictConfig) -> None:
+    data_split = hparams.data_split  # test or val
+    experiment_name = hparams.experiment_name
+    study_name = f"{experiment_name}_{hparams.outcome}"
+
+    subset_size = hparams.subset_size
+    if subset_size is not None:
+        study_name += f"_{subset_size}"
+        experiment_name += f"_{subset_size}"
+
+    study_file = FPATH.OPTUNA / "lr" / f"lr_optuna_study_{study_name}.pkl"
+
+    print(
+        f"Doing inference for experiment {experiment_name}_{hparams.outcome}, datasplit: {data_split}"
+    )
     print("Loading data")
-    input_data_path = FPATH.DATA / f"{data_split}_sparse_matrix.npz"
-    outcome_data_path = FPATH.DATA / f"{data_split}_y.npy"
-    
-    copy_file_or_dir(input_data_path)
-    copy_file_or_dir(outcome_data_path)
 
-    study = joblib.load(FPATH.OPTUNA / f"lr_optuna_study_{experiment}.pkl")
-
-    best_model_path = study.best_trial.user_attrs["best_model_path"]
-
-    # Load the model from the checkpoint without specifying hyperparameters
-    model = LogisticRegression.load_from_checkpoint(checkpoint_path=best_model_path)
-
-    # Load test data for inference
-    data = load_npz(input_data_path)
-    dataset = SparseDataset(data)  # Dummy labels
-    dataloader = DataLoader(
-        dataset, batch_size=2048, shuffle=False, num_workers=32
+    input_data_path = (
+        FPATH.DATA
+        / hparams.data_folder
+        / f"{hparams.outcome}_{data_split}_sparse_matrix.npz"
+    )
+    outcome_data_path = (
+        FPATH.DATA / hparams.data_folder / f"{hparams.outcome}_{data_split}_y.npy"
     )
 
-    # Run inference
-    trainer = pl.Trainer()
+    # Load best model from study
+
+    study = joblib.load(study_file)
+    best_model_path = study.best_trial.user_attrs["best_model_path"]
+    model = LogisticRegression.load_from_checkpoint(checkpoint_path=best_model_path)
+
+    # Inference
+    data = load_npz(FPATH.swap_drives(input_data_path))
+    dataset = SparseDataset(data)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=hparams.batch_size,
+        shuffle=False,
+        num_workers=hparams.num_workers,
+    )
+
+    trainer = pl.Trainer(accelerator="auto", devices=1, logger=False)
     predictions = trainer.predict(model, dataloaders=dataloader)
-
-    # Save the predictions
     predictions = torch.cat(predictions).detach().cpu().numpy()
-    output_file_name = FPATH.DATA / f"lr_preds_{experiment}_{data_split}.npy"
-    np.save(output_file_name, predictions)
-    FPATH.alternative_copy_to_opposite_drive(output_file_name)
 
-    # Evaluate the model
-    y_true = np.load(outcome_data_path)
-    auc_score = roc_auc_score(y_true, predictions)
-    print(f"ROC AUC Score: {auc_score:.4f}")
+    # Save predictions
+    output_folder = FPATH.DATA / hparams.output_folder
+    output_folder.mkdir(exist_ok=True)
+    output_file = output_folder / f"lr_preds_{study_name}_{data_split}.npy"
+
+    np.save(output_file, predictions)
+    FPATH.alternative_copy_to_opposite_drive(output_file)
+
+    # Evaluate
+    y_true = np.load(FPATH.swap_drives(outcome_data_path))
+    try:
+        auc_score = roc_auc_score(y_true, predictions)
+        print(f"ROC AUC Score: {auc_score:.4f}")
+    except ValueError:
+        pass
+
+
+if __name__ == "__main__":
+    main()
