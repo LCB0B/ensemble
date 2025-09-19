@@ -7,7 +7,6 @@ import torch  # noqa: E402
 import polars as pl  # noqa: E402
 from pathlib import PosixPath
 from src.datamodule2 import PretrainDataModule  # noqa: E402
-from src.encoder_nano_risk import PretrainNanoEncoder  # noqa: E402
 from src.paths import FPATH, check_and_copy_file_or_dir, get_wandb_runid  # noqa: E402
 from lightning.pytorch import Trainer  # noqa: E402
 from lightning.pytorch.callbacks import (  # noqa: E402
@@ -79,6 +78,15 @@ dm.prepare_data()  # TODO: Ideally we should not call this and let Lightning cal
 
 # get vocab size
 hparams["vocab_size"] = len(dm.pipeline.vocab)
+
+# Import appropriate model based on time encoding
+time_encoding = hparams.get("time_encoding", "time2vec")
+if time_encoding == "time_tokens":
+    from src.encoder_nano_timetoken import PretrainNanoEncoder
+    print(f"Using time tokens model for time_encoding={time_encoding}")
+else:
+    from src.encoder_nano_risk import PretrainNanoEncoder
+    print(f"Using Time2Vec model for time_encoding={time_encoding}")
 
 # Model
 model = PretrainNanoEncoder(**hparams)

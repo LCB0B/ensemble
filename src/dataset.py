@@ -101,11 +101,15 @@ class LMDBDataset(Dataset):
         with lmdb.open(str(lmdb_path), map_size=map_size) as env:
             with env.begin(write=True) as txn:
                 for chunk_df in yield_chunks(data):
-                    for person in (
-                        chunk_df.group_by("person_id")
-                        .agg(pl.all().sort_by("abspos"))
-                        .iter_rows(named=True)
-                    ):
+                    # Check if we have abspos column (Time2Vec mode) or not (time tokens mode)
+                    if "abspos" in chunk_df.columns:
+                        # Time2Vec mode: sort by abspos
+                        grouped = chunk_df.group_by("person_id").agg(pl.all().sort_by("abspos"))
+                    else:
+                        # Time tokens mode: data should already be in temporal order, so just aggregate
+                        grouped = chunk_df.group_by("person_id").agg(pl.all())
+
+                    for person in grouped.iter_rows(named=True):
                         pnr = person.pop("person_id")
                         lengths["person_id"].append(pnr)
                         lengths["length"].append(

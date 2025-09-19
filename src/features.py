@@ -60,13 +60,46 @@ def create_age_tokens(df: pl.DataFrame, birthdates: pl.DataFrame, vocab: dict) -
     )
 
 
-def insert_time_tokens_into_events(df: pl.DataFrame) -> pl.DataFrame:
-    """Inserts year_token and age_token at the beginning of each event sequence"""
-    return df.with_columns(
-        event=pl.col("year_token").cast(pl.List(pl.Int64)).list.concat(
-            pl.col("age_token").cast(pl.List(pl.Int64))
-        ).list.concat(pl.col("event"))
-    ).drop("year_token", "age_token")
+def insert_time_tokens_conditionally(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Inserts time tokens using precomputed position vectors.
+    Extremely fast implementation that precomputes all temporal boundaries.
+    """
+    if len(df) == 0:
+        return df.select(["person_id", "event"])
+
+    # Precompute temporal boundary positions for maximum speed
+    return (
+        df
+        .with_row_index("row_idx")
+        .with_columns([
+            # Compute boundaries in one pass using row comparison
+            (
+                (pl.col("year_token") != pl.col("year_token").shift(1).over("person_id")) |
+                (pl.int_range(pl.len()).over("person_id") == 0)
+            ).alias("needs_year"),
+            (
+                (pl.col("age_token") != pl.col("age_token").shift(1).over("person_id")) |
+                (pl.int_range(pl.len()).over("person_id") == 0)
+            ).alias("needs_age"),
+        ])
+        .with_columns([
+            # Build time tokens list in single operation using case logic
+            pl.when(pl.col("needs_year") & pl.col("needs_age"))
+            .then(pl.concat_list([pl.col("year_token"), pl.col("age_token")]))
+            .when(pl.col("needs_year"))
+            .then(pl.col("year_token").cast(pl.List(pl.Int64)))
+            .when(pl.col("needs_age"))
+            .then(pl.col("age_token").cast(pl.List(pl.Int64)))
+            .otherwise(pl.lit([]).cast(pl.List(pl.Int64)))
+            .alias("time_prefix")
+        ])
+        .with_columns([
+            # Single list concatenation
+            pl.col("time_prefix").list.concat(pl.col("event")).alias("event")
+        ])
+        .select(["person_id", "event"])
+    )
 
 
 def create_ages(df: pl.DataFrame, birthdates: pl.DataFrame):
@@ -178,16 +211,21 @@ def create_tokenized_events(
                     chunk_df = create_abspos(chunk_df)
                     chunk_df = chunk_df.drop("date_col")
                 else:
-                    # Time tokens mode: insert time tokens into event sequences
+                    # Time tokens mode: insert time tokens conditionally when temporal boundaries change
                     chunk_df = create_year_tokens(chunk_df, vocab)
                     chunk_df = create_age_tokens(chunk_df, birthdates, vocab)
-                    chunk_df = insert_time_tokens_into_events(chunk_df)
-                    chunk_df = chunk_df.drop("date_col")
 
-                    # Track time token insertion stats
+                    # Store original event lengths before time token insertion
                     if log_dir:
+                        pre_insertion_lengths = chunk_df.select(pl.col("event").list.len()).to_series().to_list()
+
+                    chunk_df = insert_time_tokens_conditionally(chunk_df)
+
+                    # Track time token insertion stats - calculate actual tokens added
+                    if log_dir:
+                        post_insertion_lengths = chunk_df.select(pl.col("event").list.len()).to_series().to_list()
+                        tokens_added_this_batch = sum(post - pre for pre, post in zip(pre_insertion_lengths, post_insertion_lengths))
                         batch_events = len(chunk_df)
-                        tokens_added_this_batch = batch_events * 2  # year + age per event
                         total_events_processed += batch_events
                         total_tokens_added += tokens_added_this_batch
 
