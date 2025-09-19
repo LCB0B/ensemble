@@ -118,7 +118,7 @@ trainer = Trainer(
     strategy="auto",  # strategy,
     deterministic=False,
     precision=hparams["precision"],
-    log_every_n_steps=100,
+    log_every_n_steps=1,
     #fast_dev_run=100,
     # profiler="simple",
 )

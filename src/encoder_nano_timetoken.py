@@ -209,6 +209,11 @@ class PretrainNanoEncoder(BaseNanoEncoder):
 
         return loss, decoded_output
 
+    def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
+        loss, decoded_output = self.standard_step(batch, batch_idx)
+        self.log("train/loss", loss, batch_size=batch["event"].size(0))
+        return loss
+
     def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         loss, decoded_output = self.standard_step(batch, batch_idx)
         self.log("val/loss", loss, sync_dist=True, batch_size=batch["event"].size(0))

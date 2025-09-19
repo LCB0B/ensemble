@@ -7,7 +7,7 @@ import torch  # noqa: E402
 import polars as pl  # noqa: E402
 from pathlib import PosixPath
 from src.datamodule2 import PretrainDataModule  # noqa: E402
-from src.encoder_nano_risk import PretrainNanoEncoder  # noqa: E402
+from src.encoder_nano_timetoken import PretrainNanoEncoder  # noqa: E402
 from src.paths import FPATH, check_and_copy_file_or_dir, get_wandb_runid  # noqa: E402
 from lightning.pytorch import Trainer  # noqa: E402
 from lightning.pytorch.callbacks import (  # noqa: E402
@@ -68,6 +68,8 @@ dm = PretrainDataModule(
     source_dir=hparams["source_dir"],
     pretrain_style=hparams["pretrain_style"],
     masking_ratio=hparams.get("masking_ratio"),
+    time_encoding=hparams.get("time_encoding", "time2vec"),
+    enable_logging=hparams.get("enable_logging", True),
 )
 
 dm.prepare_data()  # TODO: Ideally we should not call this and let Lightning call it (and get the dm info somewhere else)
@@ -105,7 +107,7 @@ trainer = Trainer(
     strategy="auto",  # strategy,
     deterministic=False,
     precision=hparams["precision"],
-    log_every_n_steps=100,
+    log_every_n_steps=1,
     #fast_dev_run=100,
     # profiler="simple",
 )

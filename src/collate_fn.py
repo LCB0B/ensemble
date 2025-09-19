@@ -110,6 +110,11 @@ class Collate:
         **pad_kwargs,
     ) -> torch.Tensor:
         """Pads the sequence (using pad_kwargs) converts to tensor"""
+        # Handle empty sequences
+        if len(sequence) == 0:
+            # Return empty tensor with appropriate shape for batch_first=True
+            return torch.empty(0, 0, dtype=dtype)
+
         # Convert to tensors and pad with dtype conversion
         if not torch.is_tensor(sequence[0]) or dtype != sequence[0].dtype:
             sequence = [torch.as_tensor(seq, dtype=dtype) for seq in sequence]

@@ -1,47 +1,159 @@
-# Vocab info
+
+
 # Model info
 # MOST INFO IS NOT USED
-
-d_model: 128
-dim_feedforward: 512 # Not used in nanoGPT, set to 4xd_model
-num_heads: 4
-num_layers: 16
+d_model: 32
+num_heads: 2
+num_layers: 2
 dropout: 0.1
 bias: False
+swiglu: False
 
 # Optimizer info
+
 beta1: 0.9
+
 beta2: 0.999
+
 weight_decay: 0.1
-learning_rate: 0.0005
-optimizer_warmup_epochs: 2
+
+learning_rate: 0.0003 #0.00001
+
+warmup_steps: 50000
 
 # Dataloading info
-batch_size: 32
-num_workers: 8
-max_seq_len: 2048
+
+#n_tokens: 425000 # for MLM30
+
+n_tokens: 160000 # 8e5 for A100, 3.5e5 for A10
+
+num_workers: 4
+
+pretrain_style: AR
+
+masking_ratio: 0.15
+
+max_seq_len: 8192 #512*3 total
+
+# Model info
+
+cls_token: False
+
+sep_token: False
+
+segment: True
+
+subset_background: False
+
+# Time encoding configuration
+# Options: "time2vec" (default, continuous time encoding) or "time_tokens" (discrete year/age tokens)
+time_encoding: time2vec
+
+# Enable logging for data creation process
+enable_logging: true
 
 # Some additional info
-max_epochs: 10
-sources: life_test
-background: life_test/background
-experiment_name: pretrain_life
-fname_prefix: pretrain_life
-dir_path: life_test_compiled #data
+
+max_epochs: 5
+
 precision: 16-mixed
+
 float32_matmul_precision: medium
-compile: False # Dynamic shapes causes a large amount of recompilations if compiling
-collate_method: flatten_and_expand
 
-# Some additional info
-#CUDA_VISIBLE_DEVICES: 3
-token_freq_cutoff: 100
-experiment_name: stable_pretrain
-cutoff_year: 2018
-include_cls: False
+# load_pretrained_model: destiny/007_enchanting_lynx-pretrain-mlm15-lr0.0003/best.ckpt
 
+# load_pretrained_model: destiny/009_devoted_ocelot-pretrain-mlm30-lr0.0003/best.ckpt
 
-include_segment: true
-include_sep: true
-swiglu: True
-load_failed_model: True
+# load_pretrained_model: destiny/014_shrewd_fox-pretrain-autoregressive-lr0.0003/best.ckpt
+
+# Data config
+
+experiment_name: destiny
+
+dir_path: destiny_dataset
+
+lengths: lengths
+
+source_dir: destiny
+
+background: background
+
+sources:
+
+  # Demographics
+
+  - address_change
+
+  - bef_updates
+
+  - family_births_deaths
+
+  - marital_status
+
+  - migration
+
+  # Labour & income
+
+  - akm
+
+  - amrun
+
+  - ind
+
+  # Health
+
+  - lmdb
+
+  - lpr
+
+  - sygesik
+
+  # Education
+
+  - primary_school_grades
+
+  - high_school_grades
+
+  - higher_ed_grades
+
+  - enrollment
+
+  - graduation
+
+  - diploma_grades
+
+  - qualifications
+
+  - wellbeing
+
+  - national_tests
+
+  - absences
+
+  # Social conditions
+
+  - decisions
+
+  - charges
+
+  - conferred_charges
+
+  - minor_charges
+
+  - victims
+
+  - jail_parole_start
+
+  - jail_end
+
+  - parole_end
+
+  - out_of_home_placements
+
+  - drug_treatment_start
+
+  - drug_treatment_end
+
+  - preventative_measures_start
+
+  - preventative_measures_end
