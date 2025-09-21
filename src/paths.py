@@ -32,8 +32,8 @@ class ProjectPaths:
             self.FPATH_PROJECT = Path(rf"K:/{k_home}")
             self.FPATH_D_DRIVE = Path(rf"D:/work/{getpass.getuser()}")
 
-        self.DATA = self.FPATH_D_DRIVE / "data" / 'data_reverted'
-        self.NETWORK_DATA = self.FPATH_PROJECT / "data" / 'data_reverted'
+        self.DATA = self.FPATH_D_DRIVE / "data" 
+        self.NETWORK_DATA = self.FPATH_PROJECT / "data" 
         # TODO: Decide whether to log to local or network
         # self.CHECKPOINTS: Path = self.FPATH_D_DRIVE / "checkpoints"
         self.CHECKPOINTS = self.FPATH_PROJECT / "checkpoints"

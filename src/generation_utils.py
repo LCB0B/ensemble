@@ -6,13 +6,15 @@ Contains all generation-related functions with proper dtype handling.
 import torch
 import yaml
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple, Union
 from src.encoder_nano_risk import GenerativeNanoEncoder
+from src.encoder_nano_timetoken import GenerativeNanoEncoder as TimeTokenGenerativeNanoEncoder
 from src.datamodule2 import PretrainDataModule
 import polars as pl
 import pyarrow.dataset as ds
 from src.paths import FPATH
 import json
+import re
 
 
 _VOCAB_CACHE = {}
@@ -79,6 +81,472 @@ def decode_ids(ids, vocab: dict, unknown_token="?"):
     if not vocab:
         return [str(i) for i in ids]
     return [vocab.get(int(i), f"{i}:{unknown_token}") for i in ids]
+
+
+# ============================================================================
+# TIME TOKEN UTILITIES
+# ============================================================================
+
+def extract_time_tokens(vocab: Dict[int, str]) -> Dict[str, Dict[str, int]]:
+    """
+    Extract time token mappings from vocabulary.
+
+    Args:
+        vocab: Dictionary mapping token_id -> token_string
+
+    Returns:
+        Dictionary with 'year_tokens' and 'age_tokens' mappings
+    """
+    year_tokens = {}  # "YEAR_2010" -> token_id
+    age_tokens = {}   # "AGE_25" -> token_id
+
+    year_pattern = re.compile(r'^YEAR_(\d{4})$')
+    age_pattern = re.compile(r'^AGE_(\d{1,3})$')
+
+    for token_id, token_str in vocab.items():
+        year_match = year_pattern.match(token_str)
+        if year_match:
+            year = int(year_match.group(1))
+            year_tokens[f"YEAR_{year}"] = token_id
+
+        age_match = age_pattern.match(token_str)
+        if age_match:
+            age = int(age_match.group(1))
+            age_tokens[f"AGE_{age}"] = token_id
+
+    return {
+        "year_tokens": year_tokens,
+        "age_tokens": age_tokens
+    }
+
+
+def find_time_tokens_in_sequence(sequence: List[int], vocab: Dict[int, str]) -> List[Tuple[int, str, str]]:
+    """
+    Find all time tokens in a sequence.
+
+    Args:
+        sequence: List of token IDs
+        vocab: Dictionary mapping token_id -> token_string
+
+    Returns:
+        List of (position, token_type, token_value) tuples
+        where token_type is 'YEAR' or 'AGE'
+    """
+    time_tokens = []
+    year_pattern = re.compile(r'^YEAR_(\d{4})$')
+    age_pattern = re.compile(r'^AGE_(\d{1,3})$')
+
+    for pos, token_id in enumerate(sequence):
+        token_str = vocab.get(token_id, "")
+
+        year_match = year_pattern.match(token_str)
+        if year_match:
+            time_tokens.append((pos, "YEAR", year_match.group(1)))
+
+        age_match = age_pattern.match(token_str)
+        if age_match:
+            time_tokens.append((pos, "AGE", age_match.group(1)))
+
+    return time_tokens
+
+
+def find_start_position(sequence: List[int], vocab: Dict[int, str],
+                       start_condition: Dict[str, Union[str, int]]) -> Optional[int]:
+    """
+    Find starting position in sequence based on condition.
+
+    Args:
+        sequence: List of token IDs
+        vocab: Dictionary mapping token_id -> token_string
+        start_condition: {"type": "index|age|year", "value": position/age/year}
+
+    Returns:
+        Starting position or None if not found
+    """
+    start_type = start_condition.get("type")
+    start_value = start_condition.get("value")
+
+    if start_type == "index":
+        pos = int(start_value)
+        return pos if 0 <= pos < len(sequence) else None
+
+    elif start_type == "age":
+        target_age = f"AGE_{start_value}"
+        time_tokens = find_time_tokens_in_sequence(sequence, vocab)
+        for pos, token_type, token_value in time_tokens:
+            if token_type == "AGE" and f"AGE_{token_value}" == target_age:
+                return pos
+        return None
+
+    elif start_type == "year":
+        target_year = f"YEAR_{start_value}"
+        time_tokens = find_time_tokens_in_sequence(sequence, vocab)
+        for pos, token_type, token_value in time_tokens:
+            if token_type == "YEAR" and f"YEAR_{token_value}" == target_year:
+                return pos
+        return None
+
+    return None
+
+
+
+def should_stop_generation(generated_tokens: List[int], vocab: Dict[int, str],
+                          stop_condition: Dict[str, Union[str, int]],
+                          start_time_context: Optional[Dict[str, int]] = None) -> bool:
+    """
+    Check if generation should stop based on condition.
+
+    Args:
+        generated_tokens: List of newly generated token IDs
+        vocab: Dictionary mapping token_id -> token_string
+        stop_condition: {"type": "tokens|age|year", "value": count/age/year}
+        start_time_context: Optional context about starting time for relative stopping
+
+    Returns:
+        True if generation should stop
+    """
+    stop_type = stop_condition.get("type")
+    stop_value = stop_condition.get("value")
+
+    if stop_type == "tokens":
+        return len(generated_tokens) >= int(stop_value)
+
+    elif stop_type == "age":
+        target_age = int(stop_value)
+        time_tokens = find_time_tokens_in_sequence(generated_tokens, vocab)
+        for pos, token_type, token_value in time_tokens:
+            if token_type == "AGE" and int(token_value) >= target_age:
+                return True
+        return False
+
+    elif stop_type == "year":
+        target_year = int(stop_value)
+        time_tokens = find_time_tokens_in_sequence(generated_tokens, vocab)
+        for pos, token_type, token_value in time_tokens:
+            if token_type == "YEAR" and int(token_value) >= target_year:
+                return True
+        return False
+
+    return False
+
+
+def load_time_token_model(checkpoint_path: str, hparams_path: str) -> Tuple[TimeTokenGenerativeNanoEncoder, Dict]:
+    """
+    Load a time token model for generation.
+
+    Args:
+        checkpoint_path: Path to model checkpoint
+        hparams_path: Path to hyperparameters YAML file
+
+    Returns:
+        Tuple of (model, hparams)
+    """
+    with open(hparams_path, 'r') as f:
+        hparams = yaml.safe_load(f)
+
+    model = TimeTokenGenerativeNanoEncoder(**hparams)
+
+    # Load weights from checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    state_dict = checkpoint.get('state_dict', checkpoint)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    if missing:
+        print(f"Missing keys: {len(missing)}")
+    if unexpected:
+        print(f"Unexpected keys: {len(unexpected)}")
+
+    model.eval()
+    return model, hparams
+
+
+def setup_time_token_datamodule(hparams: Dict) -> Tuple[PretrainDataModule, Dict]:
+    """
+    Setup datamodule for time token generation.
+
+    Args:
+        hparams: Hyperparameters dictionary
+
+    Returns:
+        Tuple of (datamodule, updated_hparams)
+    """
+    # Handle both compiled dataset and raw sources
+    if hparams.get("sources"):
+        source_paths = [
+            (FPATH.DATA / hparams["source_dir"] / path).with_suffix(".parquet")
+            for path in hparams["sources"]
+        ]
+        background_path = (
+            FPATH.DATA / hparams["source_dir"] / hparams["background"]
+        ).with_suffix(".parquet")
+
+        sources = [ds.dataset(s, format="parquet") for s in source_paths]
+        background = pl.read_parquet(background_path)
+    else:
+        # Use compiled dataset
+        sources = []
+        background = None
+
+    dm = PretrainDataModule(
+        dir_path=FPATH.DATA / hparams["dir_path"],
+        sources=sources,
+        background=background,
+        subset_background=hparams.get("subset_background", False),
+        n_tokens=hparams.get("n_tokens", 160000),
+        lengths=hparams.get("lengths", "lengths"),
+        num_workers=0,  # Use 0 for generation
+        max_seq_len=hparams.get("max_seq_len", 26000),
+        source_dir=hparams.get("source_dir", "destiny"),
+        pretrain_style=hparams.get("pretrain_style", "AR"),
+        time_encoding=hparams.get("time_encoding", "time_tokens"),
+        enable_logging=hparams.get("enable_logging", True),
+    )
+
+    dm.prepare_data()
+    dm.setup()
+
+    # Get vocab size
+    hparams["vocab_size"] = len(dm.pipeline.vocab)
+
+    return dm, hparams
+
+
+def get_sequences_from_dataloader(datamodule: PretrainDataModule, num_people: int, device: str) -> List[Dict]:
+    """
+    Extract individual person sequences from dataloader.
+
+    Args:
+        datamodule: Data module
+        num_people: Number of people to extract
+        device: Device to move tensors to
+
+    Returns:
+        List of person sequence dictionaries
+    """
+    dataloader = datamodule.val_dataloader()
+    sequences = []
+    processed = 0
+
+    for batch in dataloader:
+        # Move batch to device
+        for k, v in batch.items():
+            if torch.is_tensor(v):
+                batch[k] = v.to(device)
+
+        # Ensure attention mask exists
+        if "attn_mask" not in batch:
+            batch["attn_mask"] = (batch["event"] != 0)
+
+        batch_size = batch["event"].shape[0]
+
+        for i in range(batch_size):
+            if len(sequences) >= num_people:
+                break
+
+            # Extract single person
+            single_person = {}
+            for k, v in batch.items():
+                if torch.is_tensor(v) and v.dim() >= 2:
+                    single_person[k] = v[i:i+1]
+                else:
+                    single_person[k] = v
+
+            # Add synthetic person ID
+            single_person["synthetic_person_id"] = processed
+            processed += 1
+
+            sequences.append(single_person)
+
+        if len(sequences) >= num_people:
+            break
+
+    return sequences
+
+
+def generate_time_token_sequences(
+    model: TimeTokenGenerativeNanoEncoder,
+    datamodule: PretrainDataModule,
+    num_people: int = 5,
+    start_condition: Dict[str, Union[str, int]] = {"type": "age", "value": 18},
+    stop_condition: Dict[str, Union[str, int]] = {"type": "tokens", "value": 50},
+    num_generations: int = 5,
+    temperature: float = 1.0,
+    top_p: float = 0.9,
+    device: str = 'cuda'
+) -> List[Dict]:
+    """
+    Generate multiple sequences with time token controls.
+
+    Args:
+        model: Time token generative model
+        datamodule: Data module with time token dataset
+        num_people: Number of people to generate for
+        start_condition: Where to start generation
+        stop_condition: When to stop generation
+        num_generations: Number of generations per person
+        temperature: Sampling temperature
+        top_p: Top-p sampling parameter
+        device: Device to run on
+
+    Returns:
+        List of generation results
+    """
+    model.to(device)
+
+    # Set model to eval mode and convert to float32 for generation to avoid dtype issues
+    model.eval()
+    original_dtype = next(model.parameters()).dtype
+
+    # Keep model in original dtype (float16 for FlashAttention compatibility)
+    # but disable mixed precision to avoid autocast issues
+    if original_dtype == torch.float16:
+        model._mixed_precision = False
+
+    model_dtype = original_dtype
+
+    vocab = {i: token for token, i in datamodule.pipeline.vocab.items()}
+
+    # Get sequences from dataloader
+    print(f"Extracting {num_people} sequences from dataset...")
+    sequences = get_sequences_from_dataloader(datamodule, num_people, device)
+
+    if not sequences:
+        raise ValueError("No sequences found in dataset")
+
+    print(f"Found {len(sequences)} sequences")
+    results = []
+
+    for seq_idx, person_data in enumerate(sequences):
+        person_id = person_data["synthetic_person_id"]
+
+        try:
+            # Find start position
+            sequence = person_data['event'][0].cpu().tolist()
+            # Remove padding tokens
+            actual_length = (person_data['event'][0] != 0).sum().item()
+            sequence = sequence[:actual_length]
+
+            start_pos = find_start_position(sequence, vocab, start_condition)
+
+            if start_pos is None:
+                print(f"Start condition not found for person {person_id}")
+                continue
+
+            # Create prompt from start position
+            prompt_sequence = sequence[:start_pos + 1]
+            prompt_batch = {
+                'event': torch.tensor([prompt_sequence], dtype=torch.long).to(device),
+                'segment': person_data['segment'][:, :len(prompt_sequence)].to(device),
+                'attn_mask': torch.ones(1, len(prompt_sequence), dtype=torch.long).to(device)
+            }
+
+            # Generate multiple sequences
+            generated_sequences = []
+            generation_lengths = []
+
+            for gen_idx in range(num_generations):
+                # Set different random seed for each generation
+                torch.manual_seed(42 + gen_idx + person_id)
+
+                # Implement iterative token-by-token generation with time-aware stopping
+                max_fallback_tokens = 500  # Maximum fallback to prevent infinite loops
+                generated_tokens = []
+
+                # Create a copy of the prompt batch for this generation
+                current_batch = {
+                    'event': prompt_batch['event'].clone(),
+                    'segment': prompt_batch['segment'].clone(),
+                    'attn_mask': prompt_batch['attn_mask'].clone()
+                }
+
+                with torch.no_grad():
+                    for step in range(max_fallback_tokens):
+                        # Ensure all tensors have correct dtypes and are on correct device
+                        current_batch_prepared = {
+                            'event': current_batch['event'].long().to(device),
+                            'segment': current_batch['segment'].long().to(device),
+                            'attn_mask': current_batch['attn_mask'].long().to(device)
+                        }
+
+                        # Forward pass to get logits for next token
+                        outputs = model.forward_generation(current_batch_prepared)
+
+                        # Get logits for the last position
+                        last_pos = current_batch_prepared['attn_mask'].sum(1).long() - 1
+                        last_hidden = outputs[torch.arange(1), last_pos]  # B=1
+
+                        # Apply decoder to get vocabulary logits
+                        if last_hidden.dtype != model.decoder.weight.dtype:
+                            last_hidden = last_hidden.to(model.decoder.weight.dtype)
+                        logits = model.decoder(last_hidden).float()
+
+                        # Apply temperature and top-p sampling
+                        if temperature != 1.0:
+                            logits = logits / temperature
+
+                        if top_p is not None and top_p < 1.0:
+                            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                            sorted_indices_to_remove = cumulative_probs > top_p
+                            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                            sorted_indices_to_remove[..., 0] = 0
+                            indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+                            logits[indices_to_remove] = float('-inf')
+
+                        # Sample next token
+                        probs = torch.softmax(logits, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+                        # Add to generated tokens list
+                        next_token_id = next_token[0].item()
+                        generated_tokens.append(next_token_id)
+
+                        # Check stopping condition after each token
+                        if should_stop_generation(generated_tokens, vocab, stop_condition):
+                            break
+
+                        # Update current batch for next iteration
+                        # Extend the sequences with the new token
+                        new_event = torch.cat([current_batch['event'], next_token.unsqueeze(0)], dim=1)
+                        new_segment = torch.cat([current_batch['segment'], current_batch['segment'][:, -1:]], dim=1)
+                        new_attn_mask = torch.cat([current_batch['attn_mask'], torch.ones(1, 1, dtype=torch.long, device=device)], dim=1)
+
+                        current_batch = {
+                            'event': new_event,
+                            'segment': new_segment,
+                            'attn_mask': new_attn_mask
+                        }
+
+                generated_sequences.append(generated_tokens)
+                generation_lengths.append(len(generated_tokens))
+
+            # Package results
+            result = {
+                "person_id": person_id,
+                "prompt_tokens": prompt_sequence,
+                "generated_tokens": generated_sequences,
+                "generation_lengths": generation_lengths,
+                "start_condition": start_condition,
+                "stop_condition": stop_condition,
+                "num_generations": num_generations,
+                "generation_metadata": {
+                    "model_checkpoint": "time_token_model",
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "random_seeds": [42 + i + person_id for i in range(num_generations)]
+                }
+            }
+
+            results.append(result)
+            print(f"Generated {num_generations} sequences for person {person_id}")
+
+        except Exception as e:
+            print(f"Error generating for person {person_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    return results
 
 
 def load_pretrained_model(checkpoint_path: str, hparams: dict) -> GenerativeNanoEncoder:

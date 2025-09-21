@@ -138,35 +138,21 @@ def plot_single_experiment(experiment_name: str, log_dir: Path,
 
     # Auto-detect metrics if none specified
     if metrics is None:
-        # Try common training metrics in order of preference
-        candidate_metrics = [
-            'train/loss', 'val/loss', 'train_loss', 'val_loss',
-            'loss', 'validation_loss', 'training_loss'
-        ]
-        metrics = []
+        # Default to train/loss only
+        if 'train/loss' in scalars:
+            metrics = ['train/loss']
+        else:
+            # Fallback to other training loss metrics
+            candidate_metrics = ['train_loss', 'loss', 'training_loss']
+            metrics = []
+            for candidate in candidate_metrics:
+                if candidate in scalars:
+                    metrics = [candidate]
+                    break
 
-        # Add loss metrics that exist (prioritize training loss)
-        for candidate in candidate_metrics:
-            if candidate in scalars:
-                metrics.append(candidate)
-                # Always include both train and val loss if available
-                if candidate == 'train/loss' and 'val/loss' in scalars:
-                    if 'val/loss' not in metrics:
-                        metrics.append('val/loss')
-                elif candidate == 'val/loss' and 'train/loss' in scalars:
-                    if 'train/loss' not in metrics:
-                        metrics.insert(0, 'train/loss')  # Insert at beginning to prioritize
-
-        # Add accuracy/MLM metrics if available and we have loss metrics
-        if metrics:  # Only add other metrics if we have loss metrics
-            for metric in sorted(scalars.keys()):
-                if any(keyword in metric.lower() for keyword in ['acc', 'mlm', 'top']):
-                    if metric not in metrics:
-                        metrics.append(metric)
-
-        # If still no loss metrics, use all available
-        if not metrics:
-            metrics = list(scalars.keys())
+            # If still no training loss found, use all available
+            if not metrics:
+                metrics = list(scalars.keys())
 
         if verbose:
             print(f"Auto-detected metrics: {metrics}")
@@ -302,7 +288,7 @@ def main():
                        help='Metrics to plot for single experiment (auto-detected if not specified)')
     parser.add_argument('--smoothing', type=float, default=0.9,
                        help='Smoothing factor (0=no smoothing, 0.9=default)')
-    parser.add_argument('--save', type=str, help='Save plot to file')
+    parser.add_argument('--save', type=str, default='train_loss.png', help='Save plot to file')
     parser.add_argument('--pattern', type=str, help='Filter experiments by pattern')
     parser.add_argument('--show-metrics', action='store_true',
                        help='Show available metrics for the experiment')

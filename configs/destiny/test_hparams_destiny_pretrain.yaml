@@ -3,15 +3,15 @@ beta1: 0.9
 beta2: 0.999
 bias: false
 cls_token: false
-d_model: 256
-dir_path: destiny_dataset_timetoken
+d_model: 32
+dir_path: destiny_test_dataset_timetoken_
 dropout: 0.1
-experiment_name: destiny
+experiment_name: destiny_test
 float32_matmul_precision: medium
 learning_rate: 0.2
 lengths: lengths
 masking_ratio: 0.15
-max_epochs: 15
+max_epochs: 1
 max_seq_len: 26000
 n_tokens: 80000
 num_heads: 4
@@ -21,7 +21,7 @@ precision: 16-mixed
 pretrain_style: AR
 segment: true
 sep_token: false
-source_dir: destiny
+source_dir: destiny_test
 sources:
 - address_change
 - bef_updates

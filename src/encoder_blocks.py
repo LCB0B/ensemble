@@ -55,10 +55,29 @@ class MultiHeadAttention(nn.Module):
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_heads, self.head_dim)
         v = v.view(total, self.num_heads, self.head_dim)
+
+        # Ensure q and k have the same dtype as the rotary embedding cached tensors
+        if hasattr(self.rotary, '_cos_cached') and self.rotary._cos_cached is not None:
+            cos_dtype = self.rotary._cos_cached.dtype
+            if q.dtype != cos_dtype:
+                q = q.to(cos_dtype)
+            if k.dtype != cos_dtype:
+                k = k.to(cos_dtype)
+
         q, k = self.rotary(q, k, cu_seqlens, max_seqlen)
+
+        # Ensure v also has the same dtype for FlashAttention
+        if v.dtype != q.dtype:
+            v = v.to(q.dtype)
+
         qkv = torch.stack((q, k, v), dim=1)
         y = self.self_attn(qkv, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         y = y.view(total, C)
+
+        # Ensure y has the same dtype as the output projection weights
+        if y.dtype != self.out_proj.weight.dtype:
+            y = y.to(self.out_proj.weight.dtype)
+
         y = self.resid_dropout(self.out_proj(y))
         return y
 

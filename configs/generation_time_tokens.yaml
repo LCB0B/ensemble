@@ -1,0 +1,98 @@
+# Time Token Generation Configuration Template
+# Copy and modify this file for your specific generation needs
+
+# Model Configuration
+model:
+  # Option 1: Load from experiment (recommended)
+  experiment: "097_modern_falcon-pretrain-lr0.2"
+
+  # Option 2: Load from explicit paths
+  # checkpoint_path: "/path/to/model.ckpt"
+  # config_path: "/path/to/hparams.yaml"
+
+# Data Configuration
+data:
+  # Person selection
+  person_ids: []  # Specific person IDs (empty = random selection)
+  num_people: 10  # Number of random people if person_ids is empty
+
+# Generation Controls
+generation:
+  # Starting conditions (where to begin generation in sequence)
+  start_condition:
+    type: "age"     # Options: "age", "year", "index"
+    value: 18       # Age 18, or year 2010, or sequence index 100
+
+  # Stopping conditions (when to end generation)
+  stop_condition:
+    type: "tokens"  # Options: "tokens", "age", "year"
+    value: 50       # Generate 50 tokens, or until age 25, or until year 2015
+
+  # Multiple generations per prompt
+  num_generations: 5  # Number of different sequences per person
+
+  # Sampling parameters
+  temperature: 1.0    # Sampling randomness (0.1 = conservative, 2.0 = creative)
+  top_p: 0.9         # Top-p nucleus sampling
+
+# Output Configuration
+output:
+  directory: "generated_time_tokens"
+  filename: ""  # Auto-generated if empty
+  include_human_readable: true
+
+# System Configuration
+system:
+  device: "cuda"  # "cuda" or "cpu"
+  seed: 42        # Random seed for reproducibility
+
+# Example Configurations
+# Uncomment and modify one of these sections:
+
+# # Example 1: Generate early adulthood (18-25)
+# generation:
+#   start_condition: {type: "age", value: 18}
+#   stop_condition: {type: "age", value: 25}
+#   num_generations: 10
+#   temperature: 0.8
+#   top_p: 0.95
+
+# # Example 2: Generate specific year span (2010-2015)
+# generation:
+#   start_condition: {type: "year", value: 2010}
+#   stop_condition: {type: "year", value: 2015}
+#   num_generations: 5
+#   temperature: 1.2
+#   top_p: 0.9
+
+# # Example 3: Generate from middle of sequence
+# generation:
+#   start_condition: {type: "index", value: 500}
+#   stop_condition: {type: "tokens", value: 100}
+#   num_generations: 3
+#   temperature: 1.0
+#   top_p: 0.85
+
+# Advanced Time Token Examples
+# These require understanding of your specific time token vocabulary
+
+# # Example 4: Childhood to adolescence
+# generation:
+#   start_condition: {type: "age", value: 5}
+#   stop_condition: {type: "age", value: 16}
+#   num_generations: 8
+#   temperature: 0.9
+
+# # Example 5: Career years
+# generation:
+#   start_condition: {type: "age", value: 22}
+#   stop_condition: {type: "age", value: 65}
+#   num_generations: 5
+#   temperature: 1.1
+
+# Notes:
+# - Age tokens: AGE_0, AGE_1, ..., AGE_100
+# - Year tokens: YEAR_1970, YEAR_1971, ..., YEAR_2030
+# - Index starts at 0 (beginning of sequence)
+# - Temperature: lower = more conservative, higher = more creative
+# - Top-p: lower = more focused, higher = more diverse

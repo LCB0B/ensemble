@@ -353,6 +353,12 @@ class GenerativeNanoEncoder(PretrainNanoEncoder):
         """
         x = self.embedding(batch["event"])
         x += self.segment_embeddings(batch["segment"])
+
+        # Ensure embeddings match model dtype
+        model_dtype = next(self.parameters()).dtype
+        if x.dtype != model_dtype:
+            x = x.to(model_dtype)
+
         return x
 
     @torch.no_grad()
