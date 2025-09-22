@@ -11,7 +11,7 @@ import polars.selectors as cs
 
 from src.tokenize import tokenize
 from src.utils import calculate_abspos
-from src.log_data import log_time_token_insertion_stats, log_sequence_length_comparison
+from src.log_data import log_sequence_length_comparison
 
 
 def create_cls_source(birthdates: pl.DataFrame) -> pl.DataFrame:
@@ -113,64 +113,99 @@ def create_ages(df: pl.DataFrame, birthdates: pl.DataFrame):
     )
 
 
-def insert_time_tokens_at_boundaries(df: pl.DataFrame, vocab: dict) -> pl.DataFrame:
+def insert_time_tokens_per_batch(df: pl.DataFrame, vocab: dict) -> pl.DataFrame:
     """
-    Inserts time tokens at precise temporal boundaries using time2vec-style preprocessing.
-    Detects year and age boundaries using date_col and age, then inserts tokens at those positions.
+    DISABLE time token insertion during tokenization phase.
+
+    The issue: Time tokens were being inserted at the event level, causing
+    duplicate tokens for every data source within the same time period.
+
+    Solution: Skip time token insertion here. Time tokens should be inserted
+    later during sequence assembly when events are properly grouped by time.
+    """
+    # For now, skip time token insertion entirely but keep expected columns
+    return df.select(["person_id", "event", "age", "abspos", "date_col"])
+
+
+def insert_time_tokens_globally(df: pl.DataFrame, vocab: dict) -> pl.DataFrame:
+    """
+    Insert time tokens at global temporal boundaries across all events.
+
+    This function processes the complete chronologically-ordered dataset and inserts
+    YEAR_XXXX and AGE_YY tokens only at true temporal boundaries (new years and birthdays).
+
+    Args:
+        df: DataFrame with columns [person_id, event, age, abspos, date_col]
+        vocab: Vocabulary dictionary containing time token mappings
+
+    Returns:
+        DataFrame with time tokens inserted and temporal columns dropped: [person_id, event]
     """
     if len(df) == 0:
-        return df.select(["person_id", "event", "age", "abspos", "date_col"])
+        return df.select(["person_id", "event"])
 
-    return (
-        df
-        .with_row_index("row_idx")
-        .with_columns([
-            # Extract year from date_col for boundary detection
-            pl.col("date_col").dt.year().alias("year"),
-            # Floor age for boundary detection
-            pl.col("age").floor().alias("age_floor"),
-        ])
-        .with_columns([
-            # Detect year boundaries: year != previous year for same person
-            (
-                (pl.col("year") != pl.col("year").shift(1).over("person_id")) |
-                (pl.int_range(pl.len()).over("person_id") == 0)  # First event per person
-            ).alias("year_boundary"),
-            # Detect age boundaries: age_floor != previous age_floor for same person
-            (
-                (pl.col("age_floor") != pl.col("age_floor").shift(1).over("person_id")) |
-                (pl.int_range(pl.len()).over("person_id") == 0)  # First event per person
-            ).alias("age_boundary"),
-        ])
-        .with_columns([
-            # Create year tokens
-            pl.col("year").map_elements(
-                lambda year: vocab.get(f"YEAR_{year}", vocab["[UNK]"]),
-                return_dtype=pl.Int64
-            ).alias("year_token"),
-            # Create age tokens (clip to 0-100 range)
-            pl.col("age_floor").clip(0, 100).map_elements(
-                lambda age: vocab.get(f"AGE_{int(age)}", vocab["[UNK]"]),
-                return_dtype=pl.Int64
-            ).alias("age_token"),
-        ])
-        .with_columns([
-            # Build time tokens list based on boundaries
-            pl.when(pl.col("year_boundary") & pl.col("age_boundary"))
-            .then(pl.concat_list([pl.col("year_token"), pl.col("age_token")]))
-            .when(pl.col("year_boundary"))
-            .then(pl.col("year_token").cast(pl.List(pl.Int64)))
-            .when(pl.col("age_boundary"))
-            .then(pl.col("age_token").cast(pl.List(pl.Int64)))
-            .otherwise(pl.lit([]).cast(pl.List(pl.Int64)))
-            .alias("time_tokens")
-        ])
-        .with_columns([
-            # Prepend time tokens to event sequences
-            pl.col("time_tokens").list.concat(pl.col("event")).alias("event")
-        ])
-        .select(["person_id", "event", "age", "abspos", "date_col"])  # Keep date_col for now
-    )
+    # Sort by person and chronological order to ensure proper temporal sequencing
+    df = df.sort(["person_id", "abspos"])
+
+    # Calculate discrete temporal values for boundary detection
+    df = df.with_columns([
+        # Calculate discrete year from abspos (hours since 2020-01-01)
+        (2020 + (pl.col("abspos") / (24 * 365.25)).floor()).alias("discrete_year"),
+        # Calculate discrete age for boundary detection
+        pl.col("age").floor().alias("discrete_age"),
+    ])
+
+    # Detect temporal boundaries within each person's timeline
+    df = df.with_columns([
+        # Previous values for comparison (null for first event per person)
+        pl.col("discrete_year").shift(1).over("person_id").alias("prev_year"),
+        pl.col("discrete_age").shift(1).over("person_id").alias("prev_age"),
+    ])
+
+    # Identify boundary conditions
+    df = df.with_columns([
+        # Year boundary: first event for person OR year changed
+        (pl.col("prev_year").is_null() | (pl.col("discrete_year") != pl.col("prev_year"))).alias("year_boundary"),
+        # Age boundary: first event for person OR age changed
+        (pl.col("prev_age").is_null() | (pl.col("discrete_age") != pl.col("prev_age"))).alias("age_boundary"),
+    ])
+
+    # Create time tokens
+    df = df.with_columns([
+        # Year token
+        pl.col("discrete_year").map_elements(
+            lambda year: vocab.get(f"YEAR_{int(year)}", vocab.get("[UNK]", 0)),
+            return_dtype=pl.Int64
+        ).alias("year_token"),
+        # Age token (clip to 0-100 range)
+        pl.col("discrete_age").clip(0, 100).map_elements(
+            lambda age: vocab.get(f"AGE_{int(age)}", vocab.get("[UNK]", 0)),
+            return_dtype=pl.Int64
+        ).alias("age_token"),
+    ])
+
+    # Build time token lists for insertion
+    df = df.with_columns([
+        pl.when(pl.col("year_boundary") & pl.col("age_boundary"))
+        .then(pl.concat_list([pl.col("year_token"), pl.col("age_token")]))
+        .when(pl.col("year_boundary"))
+        .then(pl.col("year_token").cast(pl.List(pl.Int64)))
+        .when(pl.col("age_boundary"))
+        .then(pl.col("age_token").cast(pl.List(pl.Int64)))
+        .otherwise(pl.lit([]).cast(pl.List(pl.Int64)))
+        .alias("time_tokens")
+    ])
+
+    # Insert time tokens at the beginning of events that have boundaries
+    df = df.with_columns([
+        pl.when(pl.col("year_boundary") | pl.col("age_boundary"))
+        .then(pl.col("time_tokens").list.concat(pl.col("event")))
+        .otherwise(pl.col("event"))
+        .alias("event")
+    ])
+
+    # Return clean schema: only person_id and event (drop all temporal metadata)
+    return df.select(["person_id", "event"])
 
 
 def create_tokenized_events(
@@ -202,18 +237,25 @@ def create_tokenized_events(
     file_path = dir_path / "tokenized.parquet"
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Schema is now the same for both modes - time_tokens also keeps temporal metadata
-    schema = pa.schema([
-        pa.field("person_id", pa.int64()),
-        pa.field("event", pa.large_list(pa.int64())),
-        pa.field("age", pa.float64()),
-        pa.field("abspos", pa.float64()),
-    ])
+    # Schema is the same for both modes after processing
+    if time_encoding == "time2vec":
+        schema = pa.schema([
+            pa.field("person_id", pa.int64()),
+            pa.field("event", pa.large_list(pa.int64())),
+            pa.field("age", pa.float64()),
+            pa.field("abspos", pa.float64()),
+        ])
+    else:  # time_tokens - include temporal metadata during processing (cleaned up post-loop)
+        schema = pa.schema([
+            pa.field("person_id", pa.int64()),
+            pa.field("date_col", pa.timestamp("us")),
+            pa.field("event", pa.large_list(pa.int64())),
+            pa.field("age", pa.float64()),
+            pa.field("abspos", pa.float64()),
+        ])
     writer = pq.ParquetWriter(file_path, schema=schema)
 
-    # Initialize logging variables
-    total_events_processed = 0
-    total_tokens_added = 0
+    # Initialize logging variables for sequence length tracking
     original_lengths = []
     new_lengths = []
 
@@ -265,29 +307,27 @@ def create_tokenized_events(
                     chunk_df = create_abspos(chunk_df)
                     chunk_df = chunk_df.drop("date_col")
                 else:
-                    # Time tokens mode: use time2vec preprocessing then insert time tokens at boundaries
+                    # Time tokens mode: process batches like time2vec but preserve temporal metadata
                     # Sort by person_id and date_col to ensure chronological order
                     chunk_df = chunk_df.sort(["person_id", "date_col"])
                     # Use same temporal preprocessing as time2vec
                     chunk_df = create_ages(chunk_df, birthdates)
                     chunk_df = create_abspos(chunk_df)
 
-                    # Store original event lengths before time token insertion
-                    if log_dir:
-                        pre_insertion_lengths = chunk_df.select(pl.col("event").list.len()).to_series().to_list()
+                    # Normalize timestamp precision to microseconds for schema consistency
+                    # Handle both date and datetime/timestamp types
+                    date_col_dtype = chunk_df["date_col"].dtype
+                    if date_col_dtype == pl.Date:
+                        chunk_df = chunk_df.with_columns(
+                            pl.col("date_col").cast(pl.Datetime("us"))
+                        )
+                    else:
+                        chunk_df = chunk_df.with_columns(
+                            pl.col("date_col").dt.cast_time_unit("us")
+                        )
 
-                    # Insert time tokens at precise temporal boundaries
-                    chunk_df = insert_time_tokens_at_boundaries(chunk_df, vocab)
-                    # Drop date_col after boundary detection
-                    chunk_df = chunk_df.drop("date_col")
-
-                    # Track time token insertion stats - calculate actual tokens added
-                    if log_dir:
-                        post_insertion_lengths = chunk_df.select(pl.col("event").list.len()).to_series().to_list()
-                        tokens_added_this_batch = sum(post - pre for pre, post in zip(pre_insertion_lengths, post_insertion_lengths))
-                        batch_events = len(chunk_df)
-                        total_events_processed += batch_events
-                        total_tokens_added += tokens_added_this_batch
+                    # Keep temporal metadata for post-loop global time token insertion
+                    # Don't drop date_col, age, abspos yet - will be dropped after global insertion
 
                 # Add separator tokens if requested
                 if sep_token:
@@ -301,44 +341,37 @@ def create_tokenized_events(
                 writer.write_table(chunk_df.to_arrow())
     writer.close()
 
+    # Post-loop processing: Global time token insertion for time_tokens mode
+    if time_encoding == "time_tokens":
+        try:
+            print("Applying global time token insertion...")
+
+            # Read the complete dataset back for global processing
+            complete_df = pl.read_parquet(file_path)
+            print(f"Read {len(complete_df)} rows from parquet for global processing")
+
+            if len(complete_df) > 0:
+                # Apply global time token insertion
+                print("Inserting time tokens globally...")
+                complete_df = insert_time_tokens_globally(complete_df, vocab)
+
+                # Rewrite the parquet file with time tokens and clean schema
+                print("Writing cleaned parquet file...")
+                complete_df.write_parquet(file_path)
+
+                print(f"Global time token insertion complete. Clean schema: {complete_df.columns}")
+            else:
+                print("Warning: No data to process for global time token insertion!")
+        except Exception as e:
+            print(f"Error during global time token insertion: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
     # Log statistics if logging is enabled
     if log_dir:
-        if time_encoding == "time_tokens":
-            # Calculate detailed time token statistics
-            average_tokens_per_sequence = total_tokens_added / total_events_processed if total_events_processed > 0 else 0
-
-            # Calculate sequence length increases
-            if original_lengths and new_lengths:
-                length_increases = [new - orig for orig, new in zip(original_lengths, new_lengths)]
-                avg_length_increase = sum(length_increases) / len(length_increases) if length_increases else 0
-
-                # Enhanced logging with per-sequence metrics
-                enhanced_stats = {
-                    "events_processed": total_events_processed,
-                    "tokens_added": total_tokens_added,
-                    "average_tokens_per_sequence": average_tokens_per_sequence,
-                    "average_length_increase_per_sequence": avg_length_increase,
-                    "total_sequences": len(original_lengths),
-                    "length_increase_details": {
-                        "min_increase": min(length_increases) if length_increases else 0,
-                        "max_increase": max(length_increases) if length_increases else 0,
-                        "median_increase": sorted(length_increases)[len(length_increases)//2] if length_increases else 0
-                    }
-                }
-
-                from src.log_data import log_processing_phase
-                log_processing_phase(
-                    phase_name="time_token_insertion_detailed",
-                    stats=enhanced_stats,
-                    log_dir=log_dir
-                )
-
-            log_time_token_insertion_stats(
-                events_processed=total_events_processed,
-                tokens_added=total_tokens_added,
-                log_dir=log_dir,
-                batch_id="tokenized_events"
-            )
+        # Note: For time_tokens mode, detailed stats are now handled by global insertion
+        # Original logging variables are not populated since we use post-loop processing
 
         # Log sequence length comparison
         if original_lengths and new_lengths:
