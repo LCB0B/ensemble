@@ -127,6 +127,144 @@ def insert_time_tokens_per_batch(df: pl.DataFrame, vocab: dict) -> pl.DataFrame:
     return df.select(["person_id", "event", "age", "abspos", "date_col"])
 
 
+def insert_time_tokens_globally_stream(
+    input_path: Path,
+    vocab: dict,
+    chunk_rows: int = 1_000_000
+) -> None:
+    """
+    Stream-process the parquet file at input_path to insert YEAR_/AGE_ tokens
+    only at true boundaries, without loading everything into memory.
+    Overwrites input_path in place.
+
+    IMPORTANT: Input data must be pre-sorted by ["person_id", "abspos"] for correct results.
+
+    Args:
+        input_path: Path to parquet file to process (must be sorted by person_id, abspos)
+        vocab: Vocabulary dictionary containing time token mappings
+        chunk_rows: Number of rows to process per batch (default 100,000)
+    """
+    tmp_path = input_path.with_suffix(".tmp.parquet")
+
+    # First ensure the data is properly sorted by reading and re-sorting
+    print("Ensuring data is sorted by person_id and abspos...")
+    df = pl.read_parquet(input_path)
+    df = df.sort(["person_id", "abspos"])
+    df.write_parquet(input_path)
+    del df  # Free memory
+
+    dataset = ds.dataset(input_path, format="parquet")
+
+    # Output schema: person_id + event list[int64]
+    out_schema = pa.schema([
+        pa.field("person_id", pa.int64()),
+        pa.field("event", pa.large_list(pa.int64()))
+    ])
+    writer = pq.ParquetWriter(tmp_path, out_schema)
+
+    # State tracking for temporal boundaries across batches
+    last_year = {}
+    last_age = {}
+
+    print(f"Processing parquet file in chunks of {chunk_rows:,} rows...")
+
+    try:
+        batch_count = 0
+        for batch in tqdm(dataset.to_batches(batch_size=chunk_rows), desc="Processing batches"):
+            batch_count += 1
+
+            # Convert Arrow batch to Polars DataFrame for sorting within batch
+            batch_df = pl.from_arrow(batch)
+            # Ensure sorting within batch as well (in case Arrow batching disrupted order)
+            batch_df = batch_df.sort(["person_id", "abspos"])
+
+            # Convert back to lists for processing
+            person_ids = batch_df["person_id"].to_list()
+            absposes = batch_df["abspos"].to_list()
+            ages = batch_df["age"].to_list()
+            events = batch_df["event"].to_list()
+
+            new_events = []
+            current_batch_pids = set()
+
+            for pid, abspos, age, event in zip(person_ids, absposes, ages, events):
+                current_batch_pids.add(pid)
+
+                # Calculate discrete temporal values (matching original exactly)
+                year = 2020 + int(abspos / (24 * 365.25))
+                age_int = int(age)  # Don't clip here - match original behavior
+
+                # Check for temporal boundaries
+                prev_year = last_year.get(pid)
+                prev_age = last_age.get(pid)
+                year_boundary = (prev_year is None or year != prev_year)
+                age_boundary = (prev_age is None or age_int != prev_age)
+
+                # Build time tokens for boundaries
+                time_tokens = []
+                if year_boundary and age_boundary:
+                    time_tokens = [
+                        vocab.get(f"YEAR_{year}", vocab.get("[UNK]", 0)),
+                        vocab.get(f"AGE_{min(100, max(0, age_int))}", vocab.get("[UNK]", 0))
+                    ]
+                elif year_boundary:
+                    time_tokens = [vocab.get(f"YEAR_{year}", vocab.get("[UNK]", 0))]
+                elif age_boundary:
+                    time_tokens = [vocab.get(f"AGE_{min(100, max(0, age_int))}", vocab.get("[UNK]", 0))]
+
+                # Prepend time tokens to event and store
+                new_events.append(time_tokens + list(event))
+
+                # Update state
+                last_year[pid] = year
+                last_age[pid] = age_int
+
+            # Memory management: cleanup state for person_ids not seen recently
+            if batch_count % 10 == 0:  # Every 10 batches
+                _cleanup_completed_persons(current_batch_pids, last_year, last_age)
+
+            # Write processed batch
+            person_id_array = pa.array(person_ids, type=pa.int64())
+            events_array = pa.array(new_events, type=pa.large_list(pa.int64()))
+            output_table = pa.Table.from_arrays(
+                [person_id_array, events_array],
+                names=["person_id", "event"]
+            )
+            writer.write_table(output_table)
+
+        writer.close()
+
+        # Atomically replace original file
+        tmp_path.replace(input_path)
+        print(f"Streaming time token insertion complete. Processed {batch_count} batches.")
+
+    except Exception as e:
+        # Cleanup on error
+        writer.close()
+        if tmp_path.exists():
+            tmp_path.unlink()
+        print(f"Error during streaming insertion: {e}")
+        raise
+
+
+def _cleanup_completed_persons(current_batch_pids: set, last_year: dict, last_age: dict) -> None:
+    """
+    Clean up state for person_ids not in current batch to manage memory.
+    Assumes person_ids are processed roughly in order.
+    """
+    # Keep only person_ids from recent batches
+    pids_to_remove = []
+    for pid in last_year.keys():
+        if pid not in current_batch_pids:
+            pids_to_remove.append(pid)
+
+    # Remove a portion of old person_ids (conservative cleanup)
+    removal_count = min(len(pids_to_remove) // 2, 10000)  # Remove up to 10k at a time
+    for pid in pids_to_remove[:removal_count]:
+        last_year.pop(pid, None)
+        last_age.pop(pid, None)
+
+
 def insert_time_tokens_globally(df: pl.DataFrame, vocab: dict) -> pl.DataFrame:
     """
     Insert time tokens at global temporal boundaries across all events.
@@ -344,26 +482,14 @@ def create_tokenized_events(
     # Post-loop processing: Global time token insertion for time_tokens mode
     if time_encoding == "time_tokens":
         try:
-            print("Applying global time token insertion...")
+            print("Applying streaming global time token insertion...")
 
-            # Read the complete dataset back for global processing
-            complete_df = pl.read_parquet(file_path)
-            print(f"Read {len(complete_df)} rows from parquet for global processing")
+            # Use memory-efficient streaming insertion instead of loading full dataset
+            insert_time_tokens_globally_stream(file_path, vocab)
 
-            if len(complete_df) > 0:
-                # Apply global time token insertion
-                print("Inserting time tokens globally...")
-                complete_df = insert_time_tokens_globally(complete_df, vocab)
-
-                # Rewrite the parquet file with time tokens and clean schema
-                print("Writing cleaned parquet file...")
-                complete_df.write_parquet(file_path)
-
-                print(f"Global time token insertion complete. Clean schema: {complete_df.columns}")
-            else:
-                print("Warning: No data to process for global time token insertion!")
+            print("Streaming time token insertion complete.")
         except Exception as e:
-            print(f"Error during global time token insertion: {e}")
+            print(f"Error during streaming time token insertion: {e}")
             import traceback
             traceback.print_exc()
             raise
