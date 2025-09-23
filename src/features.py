@@ -146,12 +146,12 @@ def insert_time_tokens_globally_stream(
     """
     tmp_path = input_path.with_suffix(".tmp.parquet")
 
-    # First ensure the data is properly sorted by reading and re-sorting
-    print("Ensuring data is sorted by person_id and abspos...")
-    df = pl.read_parquet(input_path)
-    df = df.sort(["person_id", "abspos"])
-    df.write_parquet(input_path)
-    del df  # Free memory
+    # # First ensure the data is properly sorted by reading and re-sorting
+    # print("Ensuring data is sorted by person_id and abspos...")
+    # df = pl.read_parquet(input_path)
+    # df = df.sort(["person_id", "abspos"])
+    # df.write_parquet(input_path)
+    # del df  # Free memory
 
     dataset = ds.dataset(input_path, format="parquet")
 
