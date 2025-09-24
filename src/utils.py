@@ -143,8 +143,7 @@ def calculate_abspos(
     return (date_col - origin_point).dt.total_seconds() / 60 / 60  # hours
 
     # return (date_col - origin_point).dt.total_seconds() / 60 / 60 / 24 # days
-
-
+ 
 
 def calculate_datetime_from_abspos(
     abspos_col: pl.Expr, origin_point=pl.datetime(2020, 1, 1, time_unit="ns")

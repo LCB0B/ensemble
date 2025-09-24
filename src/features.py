@@ -14,6 +14,9 @@ from src.utils import calculate_abspos
 from src.log_data import log_sequence_length_comparison
 
 
+from itertools import zip_longest
+import duckdb
+
 def create_cls_source(birthdates: pl.DataFrame) -> pl.DataFrame:
     """Adds cls tokens to birthdates"""
     return birthdates.with_columns(cls_col=pl.lit("[CLS]"))
@@ -126,125 +129,82 @@ def insert_time_tokens_per_batch(df: pl.DataFrame, vocab: dict) -> pl.DataFrame:
     # For now, skip time token insertion entirely but keep expected columns
     return df.select(["person_id", "event", "age", "abspos", "date_col"])
 
-
 def insert_time_tokens_globally_stream(
     input_path: Path,
     vocab: dict,
     chunk_rows: int = 1_000_000
 ) -> None:
-    """
-    Stream-process the parquet file at input_path to insert YEAR_/AGE_ tokens
-    only at true boundaries, without loading everything into memory.
-    Overwrites input_path in place.
+    # 0) Globally sort the input parquet by person_id + abspos on disk via DuckDB
+    sorted_path = input_path.with_suffix(".sorted.parquet")
+    duckdb.sql(f"""
+      COPY (
+        SELECT * 
+        FROM parquet_scan('{input_path}')
+        ORDER BY person_id, abspos
+      ) TO '{sorted_path}' (FORMAT PARQUET);
+    """)
+    # now replace the unsorted file
+    sorted_path.replace(input_path)
 
-    IMPORTANT: Input data must be pre-sorted by ["person_id", "abspos"] for correct results.
-
-    Args:
-        input_path: Path to parquet file to process (must be sorted by person_id, abspos)
-        vocab: Vocabulary dictionary containing time token mappings
-        chunk_rows: Number of rows to process per batch (default 100,000)
-    """
+    # 1) proceed with streaming insertion on the now-sorted file
     tmp_path = input_path.with_suffix(".tmp.parquet")
-
-    # # First ensure the data is properly sorted by reading and re-sorting
-    # print("Ensuring data is sorted by person_id and abspos...")
-    # df = pl.read_parquet(input_path)
-    # df = df.sort(["person_id", "abspos"])
-    # df.write_parquet(input_path)
-    # del df  # Free memory
-
-    dataset = ds.dataset(input_path, format="parquet")
-
-    # Output schema: person_id + event list[int64]
-    out_schema = pa.schema([
+    dataset  = ds.dataset(input_path, format="parquet")
+    writer   = pq.ParquetWriter(tmp_path, pa.schema([
         pa.field("person_id", pa.int64()),
-        pa.field("event", pa.large_list(pa.int64()))
-    ])
-    writer = pq.ParquetWriter(tmp_path, out_schema)
+        pa.field("event",   pa.large_list(pa.int64())),
+    ]))
 
-    # State tracking for temporal boundaries across batches
     last_year = {}
-    last_age = {}
+    last_age  = {}
+    prev_pid  = None
 
-    print(f"Processing parquet file in chunks of {chunk_rows:,} rows...")
+    for batch in tqdm(dataset.to_batches(batch_size=chunk_rows), desc="Streaming…"):
+        batch_df = pl.from_arrow(batch).sort(["person_id","abspos"])
+        pids     = batch_df["person_id"].to_list()
+        abspos   = batch_df["abspos"].to_list()
+        ages     = batch_df["age"].to_list()
+        evs      = batch_df["event"].to_list()
 
-    try:
-        batch_count = 0
-        for batch in tqdm(dataset.to_batches(batch_size=chunk_rows), desc="Processing batches"):
-            batch_count += 1
+        new_events = []
+        for pid, ap, age, ev in zip(pids, abspos, ages, evs):
+            # flush old state once we move to a new person
+            if prev_pid is not None and pid != prev_pid:
+                last_year.pop(prev_pid, None)
+                last_age.pop(prev_pid,  None)
+            prev_pid = pid
 
-            # Convert Arrow batch to Polars DataFrame for sorting within batch
-            batch_df = pl.from_arrow(batch)
-            # Ensure sorting within batch as well (in case Arrow batching disrupted order)
-            batch_df = batch_df.sort(["person_id", "abspos"])
+            # compute discrete year & age
+            year  = 2020 + int(ap / (24 * 365.25))
+            age_i = int(age)
 
-            # Convert back to lists for processing
-            person_ids = batch_df["person_id"].to_list()
-            absposes = batch_df["abspos"].to_list()
-            ages = batch_df["age"].to_list()
-            events = batch_df["event"].to_list()
+            # build missing ranges
+            prev_y = last_year.get(pid)
+            prev_a = last_age.get(pid)
+            years = [year] if prev_y is None else list(range(prev_y+1, year+1))
+            ages_ = [age_i] if prev_a is None else list(range(prev_a+1, age_i+1))
 
-            new_events = []
-            current_batch_pids = set()
+            # interleave YEAR/AGE tokens
+            toks = []
+            for y, a in zip_longest(years, ages_):
+                if y is not None:
+                    toks.append(vocab.get(f"YEAR_{y}", vocab["[UNK]"]))
+                if a is not None:
+                    a_clip = max(0, min(100, a))
+                    toks.append(vocab.get(f"AGE_{a_clip}", vocab["[UNK]"]))
+            new_events.append(toks + list(ev))
 
-            for pid, abspos, age, event in zip(person_ids, absposes, ages, events):
-                current_batch_pids.add(pid)
+            # update state
+            last_year[pid] = year
+            last_age[pid]  = age_i
 
-                # Calculate discrete temporal values (matching original exactly)
-                year = 2020 + int(abspos / (24 * 365.25))
-                age_int = int(age)  # Don't clip here - match original behavior
+        # write out this batch
+        writer.write_table(pa.Table.from_arrays(
+            [pa.array(pids), pa.array(new_events, type=pa.large_list(pa.int64()))],
+            names=["person_id","event"]
+        ))
 
-                # Check for temporal boundaries
-                prev_year = last_year.get(pid)
-                prev_age = last_age.get(pid)
-                year_boundary = (prev_year is None or year != prev_year)
-                age_boundary = (prev_age is None or age_int != prev_age)
-
-                # Build time tokens for boundaries
-                time_tokens = []
-                if year_boundary and age_boundary:
-                    time_tokens = [
-                        vocab.get(f"YEAR_{year}", vocab.get("[UNK]", 0)),
-                        vocab.get(f"AGE_{min(100, max(0, age_int))}", vocab.get("[UNK]", 0))
-                    ]
-                elif year_boundary:
-                    time_tokens = [vocab.get(f"YEAR_{year}", vocab.get("[UNK]", 0))]
-                elif age_boundary:
-                    time_tokens = [vocab.get(f"AGE_{min(100, max(0, age_int))}", vocab.get("[UNK]", 0))]
-
-                # Prepend time tokens to event and store
-                new_events.append(time_tokens + list(event))
-
-                # Update state
-                last_year[pid] = year
-                last_age[pid] = age_int
-
-            # Memory management: cleanup state for person_ids not seen recently
-            if batch_count % 10 == 0:  # Every 10 batches
-                _cleanup_completed_persons(current_batch_pids, last_year, last_age)
-
-            # Write processed batch
-            person_id_array = pa.array(person_ids, type=pa.int64())
-            events_array = pa.array(new_events, type=pa.large_list(pa.int64()))
-            output_table = pa.Table.from_arrays(
-                [person_id_array, events_array],
-                names=["person_id", "event"]
-            )
-            writer.write_table(output_table)
-
-        writer.close()
-
-        # Atomically replace original file
-        tmp_path.replace(input_path)
-        print(f"Streaming time token insertion complete. Processed {batch_count} batches.")
-
-    except Exception as e:
-        # Cleanup on error
-        writer.close()
-        if tmp_path.exists():
-            tmp_path.unlink()
-        print(f"Error during streaming insertion: {e}")
-        raise
+    writer.close()
+    tmp_path.replace(input_path)
 
 
 def _cleanup_completed_persons(current_batch_pids: set, last_year: dict, last_age: dict) -> None:
