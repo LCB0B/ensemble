@@ -125,34 +125,38 @@ class LMDBDataset(Dataset):
                         # Fallback: group without sorting if no abspos column
                         grouped = chunk_df.group_by("person_id").agg(pl.all())
 
-                    # # Apply time token cleanup for time_tokens mode
-                    # if time_encoding == "time_tokens" and vocab:
-                    #     # remove trailing YEAR_/AGE_ tokens from every person's event list
-                    #     grouped = grouped.with_columns(
-                    #         pl.col("event").map_elements(
-                    #             lambda ev: self._remove_trailing_time_tokens(ev, vocab),
-                    #             return_dtype=pl.List(pl.Int64),   # note List(Int64), not List(List)
-                    #             skip_nulls=False
-                    #         )
-                    #     )
-
+                   
                     for person in grouped.iter_rows(named=True):
                         pnr = person.pop("person_id")
-                        events = person["event"] or []
 
-                        # now lengths and stored events agree
+                        # pull out raw lists
+                        abs_list = person.get("abspos", []) or []
+                        age_list = person.get("age", [])   or []
+                        events   = person.get("event", []) or []
+
+                        # remove trailing time tokens from events
+                        if time_encoding == "time_tokens" and vocab:
+                            events = self._remove_trailing_time_tokens(events, vocab)
+
+                        # now truncate abspos & age to match the cleaned events length
+                        valid_len = len(events)
+                        abs_list = abs_list[:valid_len]
+                        age_list = age_list[:valid_len]
+
+                        # overwrite person dict so what we encode is consistent
+                        person["event"]  = events
+                        person["abspos"] = abs_list
+                        person["age"]    = age_list
+
+                        # record lengths on the cleaned sequence
                         lengths["person_id"].append(pnr)
                         lengths["length"].append(sum(len(e) for e in events))
-
-                        # overwrite the person dict so encode() sees the cleaned events
-                        person["event"] = events
 
                         pnr_to_database_idx[str(pnr)] = idx
                         key   = self.encode_key(idx)
                         value = self.encode(person)
                         txn.put(key, value, overwrite=True)
                         idx += 1
-
         with open(
             dir_path / "pnr_to_database_idx.json", "w", encoding="utf-8"
         ) as json_file:
