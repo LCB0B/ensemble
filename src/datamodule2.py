@@ -130,7 +130,13 @@ class BaseLightningDataModule(L.LightningDataModule):
                 self._lengths = [self.max_seq_len]
 
     def _create_dataset(self, dataset: ds.Dataset, path: Path):
-        return LMDBDataset(dataset, path, log_dir=getattr(self.pipeline, 'log_dir', None))
+        return LMDBDataset(
+            dataset,
+            path,
+            log_dir=getattr(self.pipeline, 'log_dir', None),
+            time_encoding=self.time_encoding,
+            vocab=getattr(self.pipeline, 'vocab', None)
+        )
 
     def setup(self, stage: Literal["fit"] = None):
         """Defaults random splitting"""
@@ -312,7 +318,14 @@ class PretrainPredictDataModule(PretrainDataModule):
             .to_pandas()
             .to_dict(orient="list")
         )
-        return FinetuneLMDBDataset(dataset, path, outcomes_dict, log_dir=getattr(self.pipeline, 'log_dir', None))
+        return FinetuneLMDBDataset(
+            dataset,
+            path,
+            outcomes_dict,
+            log_dir=getattr(self.pipeline, 'log_dir', None),
+            time_encoding=self.time_encoding,
+            vocab=getattr(self.pipeline, 'vocab', None)
+        )
 
 
 class PredictFinetuneLifeLDM(BaseLightningDataModule):
@@ -358,7 +371,14 @@ class PredictFinetuneLifeLDM(BaseLightningDataModule):
         )
 
     def _create_dataset(self, dataset: ds.Dataset, path: Path):
-        return FinetuneLMDBDataset(dataset, path, self.outcomes["train"], log_dir=getattr(self.pipeline, 'log_dir', None))
+        return FinetuneLMDBDataset(
+            dataset,
+            path,
+            self.outcomes["train"],
+            log_dir=getattr(self.pipeline, 'log_dir', None),
+            time_encoding=self.time_encoding,
+            vocab=getattr(self.pipeline, 'vocab', None)
+        )
 
     def train_dataloader(self):
         train_outcomes = self.train_dataset.observations["outcome"]
@@ -408,7 +428,14 @@ class FamilyPredictFinetuneLifeLDM(PredictFinetuneLifeLDM):
             .to_pandas()
             .to_dict(orient="list")
         )
-        return FamilyFinetuneLMDBDataset(dataset, path, outcomes_dict, log_dir=getattr(self.pipeline, 'log_dir', None))
+        return FamilyFinetuneLMDBDataset(
+            dataset,
+            path,
+            outcomes_dict,
+            log_dir=getattr(self.pipeline, 'log_dir', None),
+            time_encoding=self.time_encoding,
+            vocab=getattr(self.pipeline, 'vocab', None)
+        )
 
     def collate_fn(self):
         self.collate = FamilyPredictCensorCollate(

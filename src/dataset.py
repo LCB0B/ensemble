@@ -24,18 +24,20 @@ class LMDBDataset(Dataset):
     """LMDB implementation for larger-than-memory datasets"""
 
     def __init__(
-        self, data: ds.Dataset, lmdb_path: Path, observations: Optional[Dict] = None, log_dir: Optional[Path] = None
+        self, data: ds.Dataset, lmdb_path: Path, observations: Optional[Dict] = None, log_dir: Optional[Path] = None, time_encoding: str = "time2vec", vocab: Optional[Dict] = None
     ):
         self.lmdb_path = lmdb_path
         self.data = data
         self.log_dir = log_dir
+        self.time_encoding = time_encoding
+        self.vocab = vocab
 
         dir_path = lmdb_path.parent
         check_and_copy_file_or_dir(self.lmdb_path.parent)
 
         if not lmdb_path.exists():
             print_main("Creating", lmdb_path.stem)
-            self._create_db(data, str(self.lmdb_path), dir_path)
+            self._create_db(data, str(self.lmdb_path), dir_path, time_encoding=time_encoding, vocab=vocab)
 
         with open(
             dir_path / "pnr_to_database_idx.json", "r", encoding="utf-8"
@@ -89,8 +91,23 @@ class LMDBDataset(Dataset):
         estimated_map_size = max(estimated_map_size, min_size)
         return estimated_map_size
 
+    @staticmethod
+    def _remove_trailing_time_tokens(events: List[List[int]], vocab: Dict[str, int]) -> List[List[int]]:
+        """Remove time tokens from the end of a person's event sequence until we hit a non-time-token"""
+        if not vocab or events is None:
+            return events if events is not None else []
+
+        # Get all time token IDs
+        time_token_ids = {v for k, v in vocab.items() if k.startswith(('YEAR_', 'AGE_'))}
+
+        # Remove from end while last event is a single time token
+        while events and len(events[-1]) == 1 and events[-1][0] in time_token_ids:
+            events.pop()
+
+        return events
+
     def _create_db(
-        self, data: ds.Dataset, lmdb_path: Path, dir_path: Path, map_size=None
+        self, data: ds.Dataset, lmdb_path: Path, dir_path: Path, map_size=None, time_encoding: str = "time2vec", vocab: Optional[Dict] = None
     ):
         if map_size is None:
             map_size = self._estimate_map_size(data)
@@ -101,23 +118,37 @@ class LMDBDataset(Dataset):
         with lmdb.open(str(lmdb_path), map_size=map_size) as env:
             with env.begin(write=True) as txn:
                 for chunk_df in yield_chunks(data):
-                    # Check if we have abspos column (Time2Vec mode) or not (time tokens mode)
+                    # Group and sort by abspos for both modes (time tokens are now mixed with events)
                     if "abspos" in chunk_df.columns:
-                        # Time2Vec mode: sort by abspos
                         grouped = chunk_df.group_by("person_id").agg(pl.all().sort_by("abspos"))
                     else:
-                        # Time tokens mode: data should already be in temporal order, so just aggregate
+                        # Fallback: group without sorting if no abspos column
                         grouped = chunk_df.group_by("person_id").agg(pl.all())
+
+                    # # Apply time token cleanup for time_tokens mode
+                    # if time_encoding == "time_tokens" and vocab:
+                    #     # remove trailing YEAR_/AGE_ tokens from every person's event list
+                    #     grouped = grouped.with_columns(
+                    #         pl.col("event").map_elements(
+                    #             lambda ev: self._remove_trailing_time_tokens(ev, vocab),
+                    #             return_dtype=pl.List(pl.Int64),   # note List(Int64), not List(List)
+                    #             skip_nulls=False
+                    #         )
+                    #     )
 
                     for person in grouped.iter_rows(named=True):
                         pnr = person.pop("person_id")
-                        lengths["person_id"].append(pnr)
-                        lengths["length"].append(
-                            sum([len(event) for event in person["event"]])
-                        )
-                        pnr_to_database_idx[str(pnr)] = idx
+                        events = person["event"] or []
 
-                        key = self.encode_key(idx)
+                        # now lengths and stored events agree
+                        lengths["person_id"].append(pnr)
+                        lengths["length"].append(sum(len(e) for e in events))
+
+                        # overwrite the person dict so encode() sees the cleaned events
+                        person["event"] = events
+
+                        pnr_to_database_idx[str(pnr)] = idx
+                        key   = self.encode_key(idx)
                         value = self.encode(person)
                         txn.put(key, value, overwrite=True)
                         idx += 1
@@ -272,8 +303,8 @@ class LMDBDataset(Dataset):
 class FinetuneLMDBDataset(LMDBDataset):
     """Finetuning version of LMDBDataset, which uses outcomes as observations"""
 
-    def __init__(self, data: ds.Dataset, lmdb_path: Path, outcomes: dict, log_dir: Optional[Path] = None):
-        super().__init__(data=data, lmdb_path=lmdb_path, observations=outcomes, log_dir=log_dir)
+    def __init__(self, data: ds.Dataset, lmdb_path: Path, outcomes: dict, log_dir: Optional[Path] = None, time_encoding: str = "time2vec", vocab: Optional[Dict] = None):
+        super().__init__(data=data, lmdb_path=lmdb_path, observations=outcomes, log_dir=log_dir, time_encoding=time_encoding, vocab=vocab)
 
     def __getitem__(self, idx: Union[int, List[int]]):
         output = super().__getitem__(idx)
