@@ -59,7 +59,6 @@ def build_time_token_schedule(
             schema=["person_id", "event", "age", "abspos"],
             orient="row"
         )
-        .sort(["person_id", "abspos"])
     )
 
 
@@ -73,6 +72,7 @@ def iter_time_token_batches(
     """
     Yields DataFrames of synthetic time‐token rows in batches of `batch_size` persons.
     """
+    origin_point = datetime(2020, 1, 1)
     items = list(birthdate_map.items())
     for start in range(0, len(items), batch_size):
         chunk = items[start:start+batch_size]
@@ -81,17 +81,18 @@ def iter_time_token_batches(
             birth_year = bdate.year
             # YEAR tokens
             for y in range(birth_year+1, end_year+1):
-                ap = calculate_abspos(datetime(y,1,1))
-                rows.append((pid, [vocab.get(f"YEAR_{y}", vocab["[UNK]"])], None, ap))
+                ny_date = datetime(y, 1, 1)
+                ap = (ny_date - origin_point).total_seconds() / 3600.0  # hours
+                age_at_ny = y - birth_year
+                rows.append((pid, [vocab.get(f"YEAR_{y}", vocab["[UNK]"])], float(age_at_ny), ap))
             # AGE tokens
             local_max_age = min(max_age, end_year - birth_year)
             for a in range(local_max_age+1):
                 bd = bdate + relativedelta(years=a)
-                ap = calculate_abspos(bd)
+                ap = (bd - origin_point).total_seconds() / 3600.0  # hours
                 rows.append((pid, [vocab.get(f"AGE_{a}", vocab["[UNK]"])], float(a), ap))
         yield (
-            pl.DataFrame(rows, schema=["person_id","event","age","abspos"])
-              .sort(["person_id","abspos"])
+            pl.DataFrame(rows, orient='row',schema=["person_id","event","age","abspos"])
         )
 
 
