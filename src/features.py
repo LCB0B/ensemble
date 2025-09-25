@@ -13,58 +13,15 @@ from src.tokenize import tokenize
 from src.utils import calculate_abspos
 from src.log_data import log_sequence_length_comparison
 
+from itertools import islice
 
 from datetime import datetime
-from dateutil.relativedelta import relativedelta
 
-def build_time_token_schedule(
-    birthdate_map: Dict[int, datetime],
-    vocab: Dict[str,int],
-    end_year: int = 2020,
-    max_age: int = 110,
-    base_year: int = 2020,
-) -> pl.DataFrame:
-    """
-    For each person in birthdate_map, build all
-    YEAR_ and AGE_ token‐rows from birth→end_year / max_age.
-
-    Returns a DataFrame with columns:
-      person_id:int, event:List[int], age:float|None, abspos:float
-    """
-    schedule = []
-    origin_point = datetime(2020, 1, 1)
-
-    for pid, bdate in birthdate_map.items():
-        birth_year = bdate.year
-
-        # 1) YEAR tokens at Jan 1 from (birth_year+1) through end_year
-        for y in range(birth_year + 1, end_year + 1):
-            ny_date = datetime(y, 1, 1)
-            ap_ny = (ny_date - origin_point).total_seconds() / 3600.0  # hours
-            age_at_ny = y - birth_year
-            tok_year = vocab.get(f"YEAR_{y}", vocab.get("[UNK]", 0))
-            schedule.append((pid, [tok_year], float(age_at_ny), ap_ny))
-
-        # 2) AGE tokens on each birthday from 0 up to min(max_age, end_year-birth_year)
-        max_age_local = min(max_age, end_year - birth_year)
-        for age_i in range(0, max_age_local + 1):
-            bd = bdate + relativedelta(years=age_i)
-            ap_bd = (bd - origin_point).total_seconds() / 3600.0  # hours
-            tok_age = vocab.get(f"AGE_{age_i}", vocab.get("[UNK]", 0))
-            schedule.append((pid, [tok_age], float(age_i), ap_bd))
-
-    return (
-        pl.DataFrame(
-            schedule,
-            schema=["person_id", "event", "age", "abspos"],
-            orient="row"
-        )
-    )
-
+HOURS_PER_YEAR = 365.25 * 24.0
 
 def iter_time_token_batches(
-    birthdate_map: Dict[int, datetime],
-    vocab: Dict[str,int],
+    birthdate_map: dict[int, datetime],
+    vocab: dict[str,int],
     end_year: int = 2020,
     max_age: int = 110,
     batch_size: int = 10_000,
@@ -72,27 +29,39 @@ def iter_time_token_batches(
     """
     Yields DataFrames of synthetic time‐token rows in batches of `batch_size` persons.
     """
-    origin_point = datetime(2020, 1, 1)
-    items = list(birthdate_map.items())
-    for start in range(0, len(items), batch_size):
-        chunk = items[start:start+batch_size]
+    origin = datetime(2020,1,1)
+    unk_id = vocab.get("[UNK]", 0)
+    items_iter = iter(birthdate_map.items())
+
+    while True:
+        batch = list(islice(items_iter, batch_size))
+        if not batch:
+            break
+
         rows = []
-        for pid, bdate in chunk:
-            birth_year = bdate.year
-            # YEAR tokens
-            for y in range(birth_year+1, end_year+1):
-                ny_date = datetime(y, 1, 1)
-                ap = (ny_date - origin_point).total_seconds() / 3600.0  # hours
-                age_at_ny = y - birth_year
-                rows.append((pid, [vocab.get(f"YEAR_{y}", vocab["[UNK]"])], float(age_at_ny), ap))
-            # AGE tokens
-            local_max_age = min(max_age, end_year - birth_year)
-            for a in range(local_max_age+1):
-                bd = bdate + relativedelta(years=a)
-                ap = (bd - origin_point).total_seconds() / 3600.0  # hours
-                rows.append((pid, [vocab.get(f"AGE_{a}", vocab["[UNK]"])], float(a), ap))
-        yield (
-            pl.DataFrame(rows, orient='row',schema=["person_id","event","age","abspos"])
+        for pid, bdate in batch:
+            # precompute birth_abs once
+            delta = bdate - origin
+            birth_abs = delta.days * 24.0 + delta.seconds / 3600.0
+            byear     = bdate.year
+            # YEAR tokens: at Jan 1 of each year [byear+1 .. end_year]
+            for y in range(byear+1, end_year+1):
+                token  = vocab.get(f"YEAR_{y}", unk_id)
+                # abspos = (y - 2020) * HOURS_PER_YEAR
+                ap     = (y - 2020) * HOURS_PER_YEAR
+                rows.append((pid, [token], float(y-byear), ap))
+            # AGE tokens: at each birthday from age 0..min(max_age, end_year-byear)
+            age_limit = min(max_age, end_year - byear)
+            for a in range(age_limit+1):
+                token = vocab.get(f"AGE_{a}", unk_id)
+                ap    = birth_abs + a * HOURS_PER_YEAR
+                rows.append((pid, [token], float(a), ap))
+
+        # build & yield in one shot; downstream code will sort by abspos if needed
+        yield pl.DataFrame(
+            rows,
+            orient="row",
+            schema=["person_id","event","age","abspos"],
         )
 
 
@@ -282,7 +251,7 @@ def create_tokenized_events(
            vocab=vocab,
            end_year=2020,
            max_age=100,
-           batch_size=10_000,
+           batch_size=1_000,
        ):
            writer.write_table(sched_df.to_arrow())
 
