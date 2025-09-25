@@ -1,6 +1,6 @@
 """ File for creating various features such as age, abspos, segment, etc."""
 
-from typing import List
+from typing import List, Iterator, Tuple, Dict, Any
 from pathlib import Path
 from tqdm import tqdm
 import pyarrow as pa
@@ -14,11 +14,8 @@ from src.utils import calculate_abspos
 from src.log_data import log_sequence_length_comparison
 
 
-from itertools import zip_longest
-
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-from typing import Dict, Any
 
 def build_time_token_schedule(
     birthdate_map: Dict[int, datetime],
@@ -64,6 +61,38 @@ def build_time_token_schedule(
         )
         .sort(["person_id", "abspos"])
     )
+
+
+def iter_time_token_batches(
+    birthdate_map: Dict[int, datetime],
+    vocab: Dict[str,int],
+    end_year: int = 2020,
+    max_age: int = 110,
+    batch_size: int = 10_000,
+) -> Iterator[pl.DataFrame]:
+    """
+    Yields DataFrames of synthetic time‐token rows in batches of `batch_size` persons.
+    """
+    items = list(birthdate_map.items())
+    for start in range(0, len(items), batch_size):
+        chunk = items[start:start+batch_size]
+        rows = []
+        for pid, bdate in chunk:
+            birth_year = bdate.year
+            # YEAR tokens
+            for y in range(birth_year+1, end_year+1):
+                ap = calculate_abspos(datetime(y,1,1))
+                rows.append((pid, [vocab.get(f"YEAR_{y}", vocab["[UNK]"])], None, ap))
+            # AGE tokens
+            local_max_age = min(max_age, end_year - birth_year)
+            for a in range(local_max_age+1):
+                bd = bdate + relativedelta(years=a)
+                ap = calculate_abspos(bd)
+                rows.append((pid, [vocab.get(f"AGE_{a}", vocab["[UNK]"])], float(a), ap))
+        yield (
+            pl.DataFrame(rows, schema=["person_id","event","age","abspos"])
+              .sort(["person_id","abspos"])
+        )
 
 
 def create_cls_source(birthdates: pl.DataFrame) -> pl.DataFrame:
@@ -245,14 +274,17 @@ def create_tokenized_events(
                 writer.write_table(chunk_df.to_arrow())
 
     if time_encoding == "time_tokens":
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] insert time tokens")
         birthdate_map = {row["person_id"]: row["birthday"] for row in birthdates.to_dicts()}
-        schedule_df = build_time_token_schedule(
-            birthdate_map=birthdate_map,
-            vocab=vocab,
-            end_year=2020,
-            max_age=110,
-        )
-        writer.write_table(schedule_df.to_arrow())
+        for sched_df in iter_time_token_batches(
+           birthdate_map=birthdate_map,
+           vocab=vocab,
+           end_year=2020,
+           max_age=100,
+           batch_size=10_000,
+       ):
+           writer.write_table(sched_df.to_arrow())
+
 
     writer.close()
 
