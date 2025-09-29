@@ -246,15 +246,27 @@ def create_tokenized_events(
     if time_encoding == "time_tokens":
         print(f"[{datetime.now().strftime('%H:%M:%S')}] insert time tokens")
         birthdate_map = {row["person_id"]: row["birthday"] for row in birthdates.to_dicts()}
-        for sched_df in iter_time_token_batches(
-           birthdate_map=birthdate_map,
-           vocab=vocab,
-           end_year=2020,
-           max_age=100,
-           batch_size=1_000,
-       ):
-           writer.write_table(sched_df.to_arrow())
 
+        # Calculate total batches for progress tracking
+        batch_size = 1_000
+        total_people = len(birthdate_map)
+        total_batches = (total_people + batch_size - 1) // batch_size  # Ceiling division
+
+        print(f"Processing {total_people:,} people in {total_batches:,} batches of {batch_size:,}")
+
+        for sched_df in tqdm(
+            iter_time_token_batches(
+                birthdate_map=birthdate_map,
+                vocab=vocab,
+                end_year=2020,
+                max_age=100,
+                batch_size=batch_size,
+            ),
+            total=total_batches,
+            desc="Time token batches"
+        ):
+            writer.write_table(sched_df.to_arrow())
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] done time tokens")
 
     writer.close()
 
