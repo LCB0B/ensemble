@@ -26,12 +26,14 @@ class DataPipeline:
         fill_nulls: bool = False,
         subset_background: bool = False,
         cutoff: int = 0,
+        time_encoding: str = "time2vec",
     ):
         self.cls_token = cls_token
         self.sep_token = sep_token
         self.fill_nulls = fill_nulls
         self.subset_background = subset_background
         self.cutoff = cutoff
+        self.time_encoding = time_encoding
 
         # Assigned during __call__
         self.dir_path = None
@@ -129,7 +131,7 @@ class DataPipeline:
         vocab_path = self.dir_path / "vocab.json"
 
         if (vocab := self._load_if_exists(vocab_path)) is None:
-            vocab = create_vocab(sources, cutoff=self.cutoff)
+            vocab = create_vocab(sources, cutoff=self.cutoff, time_encoding=self.time_encoding)
             with open(vocab_path, "w", encoding="utf-8") as f:
                 json.dump(vocab, f)
         return vocab
@@ -164,5 +166,6 @@ class DataPipeline:
                     sep_token=self.sep_token,
                     dir_path=self.dir_path,
                     fill_nulls=self.fill_nulls,
+                    time_encoding=self.time_encoding,
                 )  # tokenized_event is saved within create_tokenized_events function
         return tokenized_event

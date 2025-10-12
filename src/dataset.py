@@ -18,6 +18,7 @@ from src.chunking import yield_chunks
 from src.paths import check_and_copy_file_or_dir
 from src.utils import print_main
 from src.log_data import log_sequence_length_stats, calculate_sequence_length_statistics
+from src.profiler import profiler
 
 
 class LMDBDataset(Dataset):
@@ -109,69 +110,73 @@ class LMDBDataset(Dataset):
     def _create_db(
         self, data: ds.Dataset, lmdb_path: Path, dir_path: Path, map_size=None, time_encoding: str = "time2vec", vocab: Optional[Dict] = None
     ):
-        if map_size is None:
-            map_size = self._estimate_map_size(data)
-        pnr_to_database_idx = {}
-        lengths = {"person_id": [], "length": []}
+        with profiler.profile("lmdb_create_db"):
+            if map_size is None:
+                map_size = self._estimate_map_size(data)
+            pnr_to_database_idx = {}
+            lengths = {"person_id": [], "length": []}
 
-        idx = 0
-        with lmdb.open(str(lmdb_path), map_size=map_size) as env:
-            with env.begin(write=True) as txn:
-                for chunk_df in yield_chunks(data):
-                    # Group and sort by abspos for both modes (time tokens are now mixed with events)
-                    if "abspos" in chunk_df.columns:
-                        grouped = chunk_df.group_by("person_id").agg(pl.all().sort_by("abspos"))
-                    else:
-                        # Fallback: group without sorting if no abspos column
-                        grouped = chunk_df.group_by("person_id").agg(pl.all())
+            idx = 0
+            with lmdb.open(str(lmdb_path), map_size=map_size) as env:
+                with env.begin(write=True) as txn:
+                    with profiler.profile("process_chunks"):
+                        for chunk_df in yield_chunks(data):
+                            with profiler.profile("group_and_sort"):
+                                # Group and sort by abspos for both modes (time tokens are now mixed with events)
+                                if "abspos" in chunk_df.columns:
+                                    grouped = chunk_df.group_by("person_id").agg(pl.all().sort_by("abspos"))
+                                else:
+                                    # Fallback: group without sorting if no abspos column
+                                    grouped = chunk_df.group_by("person_id").agg(pl.all())
 
-                   
-                    for person in grouped.iter_rows(named=True):
-                        pnr = person.pop("person_id")
+                            with profiler.profile("write_to_lmdb"):
+                                for person in grouped.iter_rows(named=True):
+                                    pnr = person.pop("person_id")
 
-                        # pull out raw lists
-                        abs_list = person.get("abspos", []) or []
-                        age_list = person.get("age", [])   or []
-                        events   = person.get("event", []) or []
+                                    # pull out raw lists
+                                    abs_list = person.get("abspos", []) or []
+                                    age_list = person.get("age", [])   or []
+                                    events   = person.get("event", []) or []
 
-                        # remove trailing time tokens from events
-                        if time_encoding == "time_tokens" and vocab:
-                            events = self._remove_trailing_time_tokens(events, vocab)
+                                    # remove trailing time tokens from events
+                                    if time_encoding == "time_tokens" and vocab:
+                                        events = self._remove_trailing_time_tokens(events, vocab)
 
-                        # now truncate abspos & age to match the cleaned events length
-                        valid_len = len(events)
-                        abs_list = abs_list[:valid_len]
-                        age_list = age_list[:valid_len]
+                                    # now truncate abspos & age to match the cleaned events length
+                                    valid_len = len(events)
+                                    abs_list = abs_list[:valid_len]
+                                    age_list = age_list[:valid_len]
 
-                        # overwrite person dict so what we encode is consistent
-                        person["event"]  = events
-                        person["abspos"] = abs_list
-                        person["age"]    = age_list
+                                    # overwrite person dict so what we encode is consistent
+                                    person["event"]  = events
+                                    person["abspos"] = abs_list
+                                    person["age"]    = age_list
 
-                        # record lengths on the cleaned sequence
-                        lengths["person_id"].append(pnr)
-                        lengths["length"].append(sum(len(e) for e in events))
+                                    # record lengths on the cleaned sequence
+                                    lengths["person_id"].append(pnr)
+                                    lengths["length"].append(sum(len(e) for e in events))
 
-                        pnr_to_database_idx[str(pnr)] = idx
-                        key   = self.encode_key(idx)
-                        value = self.encode(person)
-                        txn.put(key, value, overwrite=True)
-                        idx += 1
-        with open(
-            dir_path / "pnr_to_database_idx.json", "w", encoding="utf-8"
-        ) as json_file:
-            json.dump(pnr_to_database_idx, json_file, indent=4)
+                                    pnr_to_database_idx[str(pnr)] = idx
+                                    key   = self.encode_key(idx)
+                                    value = self.encode(person)
+                                    txn.put(key, value, overwrite=True)
+                                    idx += 1
 
-        lengths_df = pd.DataFrame(lengths)
-        lengths_df.to_parquet(dir_path / "lengths.parquet")
+            with open(
+                dir_path / "pnr_to_database_idx.json", "w", encoding="utf-8"
+            ) as json_file:
+                json.dump(pnr_to_database_idx, json_file, indent=4)
 
-        # Log sequence length statistics if logging is enabled
-        if self.log_dir:
-            length_list = lengths["length"]
-            stats = calculate_sequence_length_statistics(length_list)
-            stats["dataset_phase"] = "lmdb_creation"
-            stats["total_sequences"] = len(length_list)
-            log_sequence_length_stats(stats, self.log_dir, filename="lmdb_sequence_length_stats.json")
+            lengths_df = pd.DataFrame(lengths)
+            lengths_df.to_parquet(dir_path / "lengths.parquet")
+
+            # Log sequence length statistics if logging is enabled
+            if self.log_dir:
+                length_list = lengths["length"]
+                stats = calculate_sequence_length_statistics(length_list)
+                stats["dataset_phase"] = "lmdb_creation"
+                stats["total_sequences"] = len(length_list)
+                log_sequence_length_stats(stats, self.log_dir, filename="lmdb_sequence_length_stats.json")
 
     def _init_db(self):
         self.env = lmdb.open(

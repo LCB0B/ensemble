@@ -347,7 +347,7 @@ def main():
     parser = argparse.ArgumentParser(description='Validate LMDB datasets for Time2Vec vs Time Tokens')
     parser.add_argument('--time2vec-path', type=str, default='data/data_reverted/destiny_dataset',
                        help='Path to Time2Vec dataset directory')
-    parser.add_argument('--timetoken-path', type=str, default='data/data_reverted/destiny_dataset_timetoken',
+    parser.add_argument('--timetoken-path', type=str, default='data/destiny_dataset_timetoken',
                        help='Path to Time Tokens dataset directory')
     parser.add_argument('--samples', type=int, default=5,
                        help='Number of sample sequences to analyze')

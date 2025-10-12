@@ -12,6 +12,7 @@ import polars.selectors as cs
 from src.tokenize import tokenize
 from src.utils import calculate_abspos
 from src.log_data import log_sequence_length_comparison
+from src.profiler import profiler
 
 from itertools import islice
 
@@ -168,106 +169,110 @@ def create_tokenized_events(
     Assumptions:
         Sources to have ID='person_id' and timestamp='date_col'
     """
-    file_path = dir_path / "tokenized.parquet"
-    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with profiler.profile("create_tokenized_events"):
+        file_path = dir_path / "tokenized.parquet"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Schema 
-    schema = pa.schema([
-        pa.field("person_id", pa.int64()),
-        pa.field("event", pa.large_list(pa.int64())),
-        pa.field("age", pa.float64()),
-        pa.field("abspos", pa.float64()),
-    ])
-   
-    writer = pq.ParquetWriter(file_path, schema=schema)
+        # Schema
+        schema = pa.schema([
+            pa.field("person_id", pa.int64()),
+            pa.field("event", pa.large_list(pa.int64())),
+            pa.field("age", pa.float64()),
+            pa.field("abspos", pa.float64()),
+        ])
 
-    # Initialize logging variables for sequence length tracking
-    original_lengths = []
-    new_lengths = []
+        writer = pq.ParquetWriter(file_path, schema=schema)
 
-    for source in tqdm(sources, "Tokenizing sources"):
-        for source_batch in source.to_batches():
-            # Sometimes there aren't any rows due to filtering of batches
-            if source_batch.num_rows > 0:  # TODO: Move this check to writing
-                chunk_df = pl.from_arrow(source_batch)
-                # Tokenize string columns
-                chunk_df = tokenize(chunk_df, vocab)
+        # Initialize logging variables for sequence length tracking
+        original_lengths = []
+        new_lengths = []
 
-                # Select event columns (by negation of non-event columns)
-                event_columns = ~cs.by_name("person_id", "date_col")
+        with profiler.profile("process_event_sources"):
+            for source in tqdm(sources, "Tokenizing sources"):
+                for source_batch in source.to_batches():
+                    # Sometimes there aren't any rows due to filtering of batches
+                    if source_batch.num_rows > 0:  # TODO: Move this check to writing
+                        with profiler.profile("process_batch"):
+                            chunk_df = pl.from_arrow(source_batch)
+                            # Tokenize string columns
+                            chunk_df = tokenize(chunk_df, vocab)
 
-                if fill_nulls:
-                    chunk_df = chunk_df.with_columns(
-                        event_columns.fill_null(vocab["[UNK]"])
-                    )
+                            # Select event columns (by negation of non-event columns)
+                            event_columns = ~cs.by_name("person_id", "date_col")
 
-                # Convert to dataframe of (person_id, date_col, event)
-                chunk_df = (
-                    chunk_df.with_columns(
-                        pl.Series("event", chunk_df.select(event_columns).to_numpy())
-                    )
-                    .select(
-                        "person_id", "date_col", "event"
-                    )  # Only select needed columns
-                    .cast(
-                        {
-                            "event": pl.List(pl.Int64),
-                        }
-                    )  # Convert numpy NaNs to Null
-                )
-                # Drop Nulls from event list (done here so it's element-wise)
-                if not fill_nulls:  # Can safely skip if nulls are filled
-                    chunk_df = chunk_df.with_columns(
-                        pl.col("event").list.drop_nulls()
-                    ).filter(pl.col("event").list.len() > 0)
+                            if fill_nulls:
+                                chunk_df = chunk_df.with_columns(
+                                    event_columns.fill_null(vocab["[UNK]"])
+                                )
 
-                # Track original sequence lengths for logging
-                if log_dir:
-                    batch_original_lengths = chunk_df.select(pl.col("event").list.len()).to_series().to_list()
-                    original_lengths.extend(batch_original_lengths)
+                            # Convert to dataframe of (person_id, date_col, event)
+                            chunk_df = (
+                                chunk_df.with_columns(
+                                    pl.Series("event", chunk_df.select(event_columns).to_numpy())
+                                )
+                                .select(
+                                    "person_id", "date_col", "event"
+                                )  # Only select needed columns
+                                .cast(
+                                    {
+                                        "event": pl.List(pl.Int64),
+                                    }
+                                )  # Convert numpy NaNs to Null
+                            )
+                            # Drop Nulls from event list (done here so it's element-wise)
+                            if not fill_nulls:  # Can safely skip if nulls are filled
+                                chunk_df = chunk_df.with_columns(
+                                    pl.col("event").list.drop_nulls()
+                                ).filter(pl.col("event").list.len() > 0)
 
-         
-                # Original Time2Vec mode: create age and abspos features
-                chunk_df = create_ages(chunk_df, birthdates)
-                chunk_df = create_abspos(chunk_df)
-                chunk_df = chunk_df.drop("date_col")
+                            # Track original sequence lengths for logging
+                            if log_dir:
+                                batch_original_lengths = chunk_df.select(pl.col("event").list.len()).to_series().to_list()
+                                original_lengths.extend(batch_original_lengths)
 
-                # Add separator tokens if requested
-                if sep_token:
-                    chunk_df = chunk_df.with_columns(add_sep_tokens(vocab["[SEP]"]))
+                            # Original Time2Vec mode: create age and abspos features
+                            chunk_df = create_ages(chunk_df, birthdates)
+                            chunk_df = create_abspos(chunk_df)
+                            chunk_df = chunk_df.drop("date_col")
 
-                # Track new sequence lengths for logging
-                if log_dir:
-                    batch_new_lengths = chunk_df.select(pl.col("event").list.len()).to_series().to_list()
-                    new_lengths.extend(batch_new_lengths)
+                            # Add separator tokens if requested
+                            if sep_token:
+                                chunk_df = chunk_df.with_columns(add_sep_tokens(vocab["[SEP]"]))
 
-                writer.write_table(chunk_df.to_arrow())
+                            # Track new sequence lengths for logging
+                            if log_dir:
+                                batch_new_lengths = chunk_df.select(pl.col("event").list.len()).to_series().to_list()
+                                new_lengths.extend(batch_new_lengths)
 
-    if time_encoding == "time_tokens":
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] insert time tokens")
-        birthdate_map = {row["person_id"]: row["birthday"] for row in birthdates.to_dicts()}
+                            writer.write_table(chunk_df.to_arrow())
 
-        # Calculate total batches for progress tracking
-        batch_size = 1_000
-        total_people = len(birthdate_map)
-        total_batches = (total_people + batch_size - 1) // batch_size  # Ceiling division
+        if time_encoding == "time_tokens":
+            with profiler.profile("insert_time_tokens"):
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] insert time tokens")
+                birthdate_map = {row["person_id"]: row["birthday"] for row in birthdates.to_dicts()}
 
-        print(f"Processing {total_people:,} people in {total_batches:,} batches of {batch_size:,}")
+                # Calculate total batches for progress tracking
+                batch_size = 1_000
+                total_people = len(birthdate_map)
+                total_batches = (total_people + batch_size - 1) // batch_size  # Ceiling division
 
-        for sched_df in tqdm(
-            iter_time_token_batches(
-                birthdate_map=birthdate_map,
-                vocab=vocab,
-                end_year=2020,
-                max_age=100,
-                batch_size=batch_size,
-            ),
-            total=total_batches,
-            desc="Time token batches"
-        ):
-            writer.write_table(sched_df.to_arrow())
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] done time tokens")
+                print(f"Processing {total_people:,} people in {total_batches:,} batches of {batch_size:,}")
 
-    writer.close()
+                for sched_df in tqdm(
+                    iter_time_token_batches(
+                        birthdate_map=birthdate_map,
+                        vocab=vocab,
+                        end_year=2020,
+                        max_age=100,
+                        batch_size=batch_size,
+                    ),
+                    total=total_batches,
+                    desc="Time token batches"
+                ):
+                    with profiler.profile("write_time_token_batch"):
+                        writer.write_table(sched_df.to_arrow())
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] done time tokens")
 
-    return ds.dataset(file_path)
+        writer.close()
+
+        return ds.dataset(file_path)

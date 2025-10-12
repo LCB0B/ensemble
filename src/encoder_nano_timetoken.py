@@ -246,10 +246,12 @@ class PretrainNanoEncoder(BaseNanoEncoder):
 class GenerativeNanoEncoder(PretrainNanoEncoder):
     """Extends PretrainNanoEncoder with efficient generation capabilities"""
 
-    def __init__(self, *args, max_generation_length=1024, extension_chunk_size=128, **kwargs):
+    def __init__(self, *args, max_generation_length=1024, extension_chunk_size=128, actual_vocab_size=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.max_generation_length = max_generation_length
         self.extension_chunk_size = extension_chunk_size
+        # Store actual vocabulary size (may be smaller than model's vocab_size)
+        self.actual_vocab_size = actual_vocab_size
 
         # TODO: Add KV cache initialization here
         # self.kv_cache = None  # Will store past key-value pairs
@@ -340,6 +342,45 @@ class GenerativeNanoEncoder(PretrainNanoEncoder):
         # return x, new_key_values
         return x
 
+    def get_next_token_logits(self, batch, use_autocast=True):
+        """
+        Get logits for next token prediction from a batch.
+
+        Handles hidden state extraction, position indexing, dtype conversion,
+        and decoder application. This is the standard way to get logits for
+        token-by-token generation.
+
+        Args:
+            batch: Input batch with 'event', 'segment', 'attn_mask' tensors
+            use_autocast: Whether to use autocast for mixed precision (default: True)
+
+        Returns:
+            logits: (B, vocab_size) tensor of next token logits in float32
+
+        Example:
+            >>> batch = {"event": ..., "segment": ..., "attn_mask": ...}
+            >>> logits = model.get_next_token_logits(batch, use_autocast=False)
+            >>> probs = logits.softmax(-1)
+            >>> next_token = torch.multinomial(probs, 1)
+        """
+        # Get hidden states from forward pass
+        hidden = self.forward_generation(batch, use_autocast=use_autocast)
+
+        # Extract last valid position per sequence
+        B = batch["event"].shape[0]
+        device = batch["event"].device
+        last_pos = batch["attn_mask"].sum(1).long() - 1
+        last_hidden = hidden[torch.arange(B, device=device), last_pos]
+
+        # Ensure dtype compatibility with decoder
+        if last_hidden.dtype != self.decoder.weight.dtype:
+            last_hidden = last_hidden.to(self.decoder.weight.dtype)
+
+        # Apply decoder to get vocabulary logits (return as float32 for numerical stability)
+        logits = self.decoder(last_hidden).float()
+
+        return logits
+
     def _ensure_batch_2d(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Ensure tensors are (B, T); if (T,) -> (1, T)."""
         for key in ["event", "segment", "attn_mask"]:
@@ -371,13 +412,14 @@ class GenerativeNanoEncoder(PretrainNanoEncoder):
         top_p=None,
         pad_token_id=0,
         eos_token_id=None,
+        custom_stopping_fn=None,
         use_cache=False,
         return_attention_mask=True,
         use_autocast=True,
         profile: bool = False,
         debug: bool = False,
         debug_steps: int = 3,
-        preallocate_cache: bool = True,   # NEW FLAG
+        preallocate_cache: bool = True,
     ):
         import os, time
         debug = debug or os.environ.get("DEBUG_GEN") == "1"
@@ -400,6 +442,9 @@ class GenerativeNanoEncoder(PretrainNanoEncoder):
             if name not in batch or batch[name].shape != (B, T0):
                 batch[name] = make_fn()
         ensure("segment", lambda: torch.zeros(B, T0, dtype=torch.long, device=device))
+
+        # Check if model was trained with segment embeddings disabled
+        use_segments = self.hparams.get("segment", True)  # Default to True for backwards compatibility
 
         prompt_len = T0
         if max_new_tokens <= 0:
@@ -463,73 +508,132 @@ class GenerativeNanoEncoder(PretrainNanoEncoder):
                 next_tokens = self._sample_tokens(logits, temperature, top_k, top_p, finished)
                 if eos_token_id is not None:
                     finished |= (next_tokens == eos_token_id)
+
+                # Check custom stopping function
+                if custom_stopping_fn is not None:
+                    for b_idx in range(B):
+                        if not finished[b_idx]:
+                            # Extract generated tokens INCLUDING the one we just sampled
+                            gen_start = prompt_len
+                            gen_end = current_length
+                            generated_so_far = batch["event"][b_idx, gen_start:gen_end].cpu().tolist()
+                            generated_so_far.append(next_tokens[b_idx].item())  # Include new token
+                            if custom_stopping_fn(generated_so_far):
+                                finished[b_idx] = True
+
                 generation_lengths[~finished] += 1
                 wp = current_length
                 batch["event"][:, wp] = torch.where(finished,
                                                     torch.full_like(next_tokens, pad_token_id),
                                                     next_tokens)
                 batch["attn_mask"][:, wp] = (~finished).to(batch["attn_mask"].dtype)
-                batch["segment"][:, wp] = batch["segment"][:, wp-1]
+                # Increment segment for each new token position (only if model was trained with segments)
+                if use_segments:
+                    batch["segment"][:, wp] = batch["segment"][:, wp-1] + 1
+                else:
+                    batch["segment"][:, wp] = 0  # Keep at 0 for models trained without segments
                 current_length += 1
                 if finished.all(): break
 
-        # -------- CACHE PATH WITH PREALLOCATION --------
+        # -------- FLASH ATTENTION KV CACHE PATH --------
         else:
+            # Prefill stage: Use Flash Attention with unpacked format
             prompt_batch = {
                 "event": batch["event"][:, :prompt_len],
                 "segment": batch["segment"][:, :prompt_len],
                 "attn_mask": batch["attn_mask"][:, :prompt_len],
             }
-            x = self.embed_information(prompt_batch)  # (B,T,D)
+
+            # Unpack prompt batch for Flash Attention (same as training)
+            _, indices, cu_seqlens, max_seqlen_in_batch, total = unpad_input(
+                prompt_batch["event"].unsqueeze(-1), prompt_batch["attn_mask"]
+            )
+
+            unpacked_prompt = {
+                'event': prompt_batch["event"].flatten()[indices],
+                'segment': prompt_batch["segment"].flatten()[indices],
+                'attn_mask': prompt_batch["attn_mask"],
+                'indices': indices,
+                'max_seqlen_in_batch': max_seqlen_in_batch,
+                'cu_seqlens': cu_seqlens,
+                'total': total.sum().item()
+            }
+
+            # Embed and process through transformer with Flash Attention
+            x = self.embed_information(unpacked_prompt)
+            x = self.transformer.drop(x)
+
             caches = []
             max_total_len = prompt_len + max_new_tokens
-            # Build prompt & preallocate per layer
+
+            # Build Flash KV cache for each layer
             for block in self.transformer.h:
-                if preallocate_cache:
-                    x, layer_cache = block.build_kv_cache_prealloc(x, prompt_batch["attn_mask"], max_total_len)
-                else:
-                    x, layer_cache = block.build_kv_cache(x, prompt_batch["attn_mask"])
+                x, layer_cache = block.build_flash_kv_cache(
+                    x, cu_seqlens, max_seqlen_in_batch, max_total_len
+                )
                 caches.append(layer_cache)
+
             x = self.transformer.ln_f(x)
-            last_hidden = x[:, -1:, :]
+
+            # Repad to get last hidden state
+            x_padded = pad_input(x, indices, B, max_seqlen_in_batch)
+            last_hidden = x_padded[:, -1:, :]  # (B, 1, D)
             current_length = prompt_len
 
+            # Decode stage: Token-by-token generation with Flash-compatible cache
             for step in range(max_new_tokens):
                 if profile and device.type=="cuda":
                     torch.cuda.synchronize(); t0=time.perf_counter()
 
+                # Get logits for next token
                 lh = last_hidden.squeeze(1)
                 if lh.dtype != self.decoder.weight.dtype:
                     lh = lh.to(self.decoder.weight.dtype)
                 logits = self.decoder(lh).float()
                 next_tokens = self._sample_tokens(logits, temperature, top_k, top_p, finished)
+
                 if eos_token_id is not None:
                     finished |= (next_tokens == eos_token_id)
+
+                # Check custom stopping function
+                if custom_stopping_fn is not None:
+                    for b_idx in range(B):
+                        if not finished[b_idx]:
+                            # Extract generated tokens INCLUDING the one we just sampled
+                            gen_start = prompt_len
+                            gen_end = current_length
+                            generated_so_far = batch["event"][b_idx, gen_start:gen_end].cpu().tolist()
+                            generated_so_far.append(next_tokens[b_idx].item())  # Include new token
+                            if custom_stopping_fn(generated_so_far):
+                                finished[b_idx] = True
+
                 generation_lengths[~finished] += 1
 
                 wp = current_length
                 if wp >= batch["event"].shape[1]: break
+
+                # Update batch with new token
                 batch["event"][:, wp] = torch.where(finished,
                                                     torch.full_like(next_tokens, pad_token_id),
                                                     next_tokens)
                 batch["attn_mask"][:, wp] = (~finished).to(batch["attn_mask"].dtype)
-                batch["segment"][:, wp] = batch["segment"][:, wp-1]
+                # Increment segment for each new token position (only if model was trained with segments)
+                if use_segments:
+                    batch["segment"][:, wp] = batch["segment"][:, wp-1] + 1
+                else:
+                    batch["segment"][:, wp] = 0  # Keep at 0 for models trained without segments
 
-                # New token embedding (no time features needed - time is in tokens)
+                # Embed new token
                 token_embed = (self.embedding(batch["event"][:, wp:wp+1])
                                + self.segment_embeddings(batch["segment"][:, wp:wp+1]))
 
+                # Process through Flash-compatible incremental forward
                 new_token_hidden = token_embed
                 for li, block in enumerate(self.transformer.h):
-                    cache_li = caches[li]
-                    if preallocate_cache and len(cache_li) == 3:
-                        new_token_hidden, caches[li] = block.incremental_forward_prealloc(
-                            new_token_hidden, cache_li, position_index=wp
-                        )
-                    else:
-                        new_token_hidden, caches[li] = block.incremental_forward(
-                            new_token_hidden, cache_li, position_index=wp
-                        )
+                    new_token_hidden, caches[li] = block.incremental_forward_flash(
+                        new_token_hidden, caches[li], position_index=wp
+                    )
+
                 new_token_hidden = self.transformer.ln_f(new_token_hidden)
                 last_hidden = new_token_hidden
 
@@ -633,6 +737,12 @@ class GenerativeNanoEncoder(PretrainNanoEncoder):
         """Apply sampling to logits"""
         batch_size = logits.shape[0]
         device = logits.device
+
+        # Mask invalid token IDs if actual_vocab_size is set
+        if hasattr(self, 'actual_vocab_size') and self.actual_vocab_size is not None:
+            if logits.shape[-1] > self.actual_vocab_size:
+                # Mask tokens beyond actual vocabulary
+                logits[:, self.actual_vocab_size:] = float('-inf')
 
         # Apply temperature
         if temperature != 1.0:

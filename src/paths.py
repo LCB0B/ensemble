@@ -54,6 +54,7 @@ class ProjectPaths:
         self.OPTUNA = self.LOGS / "optuna"
         self.DEFAULT_MODEL = self.CHECKPOINTS_TRANSFORMER / 'destiny' / 'model'  / 'best.ckpt'
         self.DEFAULT_HPARAMS = self.CONFIGS /'destiny' / 'hparams_destiny_pretrain.yaml'
+        self.EMBEDDINGS = self.FPATH_PROJECT / "embeddings"
 
     def swap_drives(self, fpath: Path):
         """Swaps the drive of fpath by checking parts and replacing with opposite drive"""

@@ -7,7 +7,6 @@ import torch
 import yaml
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Union
-from src.encoder_nano_risk import GenerativeNanoEncoder
 from src.encoder_nano_timetoken import GenerativeNanoEncoder as TimeTokenGenerativeNanoEncoder
 from src.datamodule2 import PretrainDataModule
 import polars as pl
@@ -230,13 +229,31 @@ def should_stop_generation(generated_tokens: List[int], vocab: Dict[int, str],
     return False
 
 
-def load_time_token_model(checkpoint_path: str, hparams_path: str) -> Tuple[TimeTokenGenerativeNanoEncoder, Dict]:
+def create_time_aware_stopping_fn(vocab: Dict[int, str], stop_condition: Dict[str, Union[str, int]]):
+    """
+    Factory function to create a time-aware stopping function for model.generate().
+
+    Args:
+        vocab: Dictionary mapping token_id -> token_string
+        stop_condition: {"type": "tokens|age|year", "value": count/age/year}
+
+    Returns:
+        Callable that takes a list of generated token IDs and returns True if should stop
+    """
+    def stopping_fn(generated_tokens: List[int]) -> bool:
+        return should_stop_generation(generated_tokens, vocab, stop_condition)
+
+    return stopping_fn
+
+
+def load_time_token_model(checkpoint_path: str, hparams_path: str, vocab_path: str = None) -> Tuple[TimeTokenGenerativeNanoEncoder, Dict]:
     """
     Load a time token model for generation.
 
     Args:
         checkpoint_path: Path to model checkpoint
         hparams_path: Path to hyperparameters YAML file
+        vocab_path: Optional path to vocabulary file to determine actual vocab size
 
     Returns:
         Tuple of (model, hparams)
@@ -244,7 +261,18 @@ def load_time_token_model(checkpoint_path: str, hparams_path: str) -> Tuple[Time
     with open(hparams_path, 'r') as f:
         hparams = yaml.safe_load(f)
 
-    model = TimeTokenGenerativeNanoEncoder(**hparams)
+    # Check actual vocabulary size if vocab_path provided
+    actual_vocab_size = None
+    if vocab_path and Path(vocab_path).exists():
+        vocab = load_vocab(vocab_path)
+        actual_vocab_size = len(vocab)
+        if actual_vocab_size != hparams.get('vocab_size'):
+            print(f"⚠️  Vocabulary size mismatch detected:")
+            print(f"   Model expects: {hparams.get('vocab_size')} tokens")
+            print(f"   Vocab file has: {actual_vocab_size} tokens")
+            print(f"   Constraining generation to valid token IDs (0-{actual_vocab_size-1})")
+
+    model = TimeTokenGenerativeNanoEncoder(actual_vocab_size=actual_vocab_size, **hparams)
 
     # Load weights from checkpoint
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -311,9 +339,15 @@ def setup_time_token_datamodule(hparams: Dict) -> Tuple[PretrainDataModule, Dict
     return dm, hparams
 
 
+# Removed: generate_time_token_sequences() wrapper function
+# Scripts should call model.generate() directly for clarity and flexibility
+
+
 def get_sequences_from_dataloader(datamodule: PretrainDataModule, num_people: int, device: str) -> List[Dict]:
     """
     Extract individual person sequences from dataloader.
+
+    Simple helper to get sequences - generation logic should be in scripts.
 
     Args:
         datamodule: Data module
@@ -363,241 +397,8 @@ def get_sequences_from_dataloader(datamodule: PretrainDataModule, num_people: in
     return sequences
 
 
-def generate_time_token_sequences(
-    model: TimeTokenGenerativeNanoEncoder,
-    datamodule: PretrainDataModule,
-    num_people: int = 5,
-    start_condition: Dict[str, Union[str, int]] = {"type": "age", "value": 18},
-    stop_condition: Dict[str, Union[str, int]] = {"type": "tokens", "value": 50},
-    num_generations: int = 5,
-    temperature: float = 1.0,
-    top_p: float = 0.9,
-    device: str = 'cuda'
-) -> List[Dict]:
-    """
-    Generate multiple sequences with time token controls.
-
-    Args:
-        model: Time token generative model
-        datamodule: Data module with time token dataset
-        num_people: Number of people to generate for
-        start_condition: Where to start generation
-        stop_condition: When to stop generation
-        num_generations: Number of generations per person
-        temperature: Sampling temperature
-        top_p: Top-p sampling parameter
-        device: Device to run on
-
-    Returns:
-        List of generation results
-    """
-    model.to(device)
-
-    # Set model to eval mode and convert to float32 for generation to avoid dtype issues
-    model.eval()
-    original_dtype = next(model.parameters()).dtype
-
-    # Keep model in original dtype (float16 for FlashAttention compatibility)
-    # but disable mixed precision to avoid autocast issues
-    if original_dtype == torch.float16:
-        model._mixed_precision = False
-
-    model_dtype = original_dtype
-
-    vocab = {i: token for token, i in datamodule.pipeline.vocab.items()}
-
-    # Get sequences from dataloader
-    print(f"Extracting {num_people} sequences from dataset...")
-    sequences = get_sequences_from_dataloader(datamodule, num_people, device)
-
-    if not sequences:
-        raise ValueError("No sequences found in dataset")
-
-    print(f"Found {len(sequences)} sequences")
-    results = []
-
-    for seq_idx, person_data in enumerate(sequences):
-        person_id = person_data["synthetic_person_id"]
-
-        try:
-            # Find start position
-            sequence = person_data['event'][0].cpu().tolist()
-            # Remove padding tokens
-            actual_length = (person_data['event'][0] != 0).sum().item()
-            sequence = sequence[:actual_length]
-
-            start_pos = find_start_position(sequence, vocab, start_condition)
-
-            if start_pos is None:
-                print(f"Start condition not found for person {person_id}")
-                continue
-
-            # Create prompt from start position
-            prompt_sequence = sequence[:start_pos + 1]
-            prompt_batch = {
-                'event': torch.tensor([prompt_sequence], dtype=torch.long).to(device),
-                'segment': person_data['segment'][:, :len(prompt_sequence)].to(device),
-                'attn_mask': torch.ones(1, len(prompt_sequence), dtype=torch.long).to(device)
-            }
-
-            # Generate multiple sequences
-            generated_sequences = []
-            generation_lengths = []
-
-            for gen_idx in range(num_generations):
-                # Set different random seed for each generation
-                torch.manual_seed(42 + gen_idx + person_id)
-
-                # Implement iterative token-by-token generation with time-aware stopping
-                max_fallback_tokens = 500  # Maximum fallback to prevent infinite loops
-                generated_tokens = []
-
-                # Create a copy of the prompt batch for this generation
-                current_batch = {
-                    'event': prompt_batch['event'].clone(),
-                    'segment': prompt_batch['segment'].clone(),
-                    'attn_mask': prompt_batch['attn_mask'].clone()
-                }
-
-                with torch.no_grad():
-                    for step in range(max_fallback_tokens):
-                        # Ensure all tensors have correct dtypes and are on correct device
-                        current_batch_prepared = {
-                            'event': current_batch['event'].long().to(device),
-                            'segment': current_batch['segment'].long().to(device),
-                            'attn_mask': current_batch['attn_mask'].long().to(device)
-                        }
-
-                        # Forward pass to get logits for next token
-                        outputs = model.forward_generation(current_batch_prepared)
-
-                        # Get logits for the last position
-                        last_pos = current_batch_prepared['attn_mask'].sum(1).long() - 1
-                        last_hidden = outputs[torch.arange(1), last_pos]  # B=1
-
-                        # Apply decoder to get vocabulary logits
-                        if last_hidden.dtype != model.decoder.weight.dtype:
-                            last_hidden = last_hidden.to(model.decoder.weight.dtype)
-                        logits = model.decoder(last_hidden).float()
-
-                        # Apply temperature and top-p sampling
-                        if temperature != 1.0:
-                            logits = logits / temperature
-
-                        if top_p is not None and top_p < 1.0:
-                            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                            sorted_indices_to_remove = cumulative_probs > top_p
-                            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                            sorted_indices_to_remove[..., 0] = 0
-                            indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
-                            logits[indices_to_remove] = float('-inf')
-
-                        # Sample next token
-                        probs = torch.softmax(logits, dim=-1)
-                        next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-                        # Add to generated tokens list
-                        next_token_id = next_token[0].item()
-                        generated_tokens.append(next_token_id)
-
-                        # Check stopping condition after each token
-                        if should_stop_generation(generated_tokens, vocab, stop_condition):
-                            break
-
-                        # Update current batch for next iteration
-                        # Extend the sequences with the new token
-                        new_event = torch.cat([current_batch['event'], next_token.unsqueeze(0)], dim=1)
-                        new_segment = torch.cat([current_batch['segment'], current_batch['segment'][:, -1:]], dim=1)
-                        new_attn_mask = torch.cat([current_batch['attn_mask'], torch.ones(1, 1, dtype=torch.long, device=device)], dim=1)
-
-                        current_batch = {
-                            'event': new_event,
-                            'segment': new_segment,
-                            'attn_mask': new_attn_mask
-                        }
-
-                generated_sequences.append(generated_tokens)
-                generation_lengths.append(len(generated_tokens))
-
-            # Package results
-            result = {
-                "person_id": person_id,
-                "prompt_tokens": prompt_sequence,
-                "generated_tokens": generated_sequences,
-                "generation_lengths": generation_lengths,
-                "start_condition": start_condition,
-                "stop_condition": stop_condition,
-                "num_generations": num_generations,
-                "generation_metadata": {
-                    "model_checkpoint": "time_token_model",
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "random_seeds": [42 + i + person_id for i in range(num_generations)]
-                }
-            }
-
-            results.append(result)
-            print(f"Generated {num_generations} sequences for person {person_id}")
-
-        except Exception as e:
-            print(f"Error generating for person {person_id}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
-
-    return results
-
-
-def load_pretrained_model(checkpoint_path: str, hparams: dict) -> GenerativeNanoEncoder:
-    """Load a pretrained model for generation"""
-    model = GenerativeNanoEncoder(**hparams)
-    
-    # Load weights from checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    model.load_state_dict(checkpoint['state_dict'], strict=False)
-    model.eval()
-    
-    return model
-
-
-def setup_datamodule(name_model: str) -> tuple[PretrainDataModule, dict]:
-    """Setup datamodule and load hparams from model directory"""
-    # Load configuration
-    with open(FPATH.TB_LOGS / "destiny" / name_model / 'hparams.yaml', "r") as f:
-        hparams = yaml.safe_load(f)
-
-    # Set up data
-    source_paths = [
-        (FPATH.DATA / hparams["source_dir"] / path).with_suffix(".parquet")
-        for path in hparams["sources"]
-    ]
-    background_path = (
-        FPATH.DATA / hparams["source_dir"] / hparams["background"]
-    ).with_suffix(".parquet")
-
-    sources = [ds.dataset(s, format="parquet") for s in source_paths]
-    background = pl.read_parquet(background_path)
-
-    dm = PretrainDataModule(
-        dir_path=FPATH.DATA / hparams["dir_path"],
-        sources=sources,
-        background=background,
-        subset_background=hparams["subset_background"],
-        n_tokens=hparams["n_tokens"],
-        lengths=hparams["lengths"],
-        num_workers=0,  # Use 0 for generation
-        max_seq_len=hparams["max_seq_len"],
-        source_dir=hparams["source_dir"],
-    )
-
-    dm.prepare_data()
-    dm.setup()
-
-    # Get vocab size
-    hparams["vocab_size"] = len(dm.pipeline.vocab)
-    
-    return dm, hparams
+# Removed: load_pretrained_model() and setup_datamodule() - these were for encoder_nano_risk
+# Use load_time_token_model() and setup_time_token_datamodule() for time token models
 
 
 def truncate_batch_sequences(batch, max_length):
@@ -905,7 +706,7 @@ def compute_generation_metrics(generated_batch: Dict[str, torch.Tensor], vocab_s
     return metrics
 
 
-def interactive_generation(model: GenerativeNanoEncoder, vocab, device='cuda'):
+def interactive_generation(model, vocab, device='cuda'):
     """Interactive generation session"""
     print("Interactive Generation Session")
     print("Enter medical event codes separated by spaces (or 'quit' to exit)")
@@ -968,9 +769,9 @@ def interactive_generation(model: GenerativeNanoEncoder, vocab, device='cuda'):
 
 
 def scenario_analysis(
-    model: GenerativeNanoEncoder, 
-    dataloader, 
-    num_batches=3, 
+    model,
+    dataloader,
+    num_batches=3,
     num_scenarios=5
 ):
     """

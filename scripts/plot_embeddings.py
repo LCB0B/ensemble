@@ -158,20 +158,40 @@ def main(embeddings_path: str, figures_dir: str = "figures",
         print(f"DPVAE latent space plot saved to {dpv_fig}")
 
 if __name__ == "__main__":
-    embeddings_path = r'/home/xc2/kdrev/22SSI/ensemble/lcbob/project2vec/embeddings/021_muddy_cobra-pretrain-lr0.0003/embeddings.npy'
-    embeddings = np.load(embeddings_path)
-    np.random.seed(42)
-    n_samples = int(1e5)
-    idx = np.random.choice(embeddings.shape[0], size=n_samples, replace=False)
-    embeddings_sample = embeddings[idx]
-    load_and_plot_embeddings(embeddings_sample)
-    # main(
-    #     embeddings_path=embedding_path,
-    #     figures_dir="figures",
-    #     use_dpv=True,  # set False to run PCA+UMAP instead
-    #     dp_params={"latent_dim": 2, "hidden_dim": 128, "trunc_K": 20, "dp_alpha": 1.0},
-    #     batch_size=64,
-    #     epochs=50,
-    #     lr=1e-3
-    # )
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Plot embeddings using PCA, UMAP, or DPVAE")
+    parser.add_argument("embeddings_path", type=str, help="Path to embeddings.npy file")
+    parser.add_argument("--figures_dir", type=str, default="figures", help="Directory to save figures")
+    parser.add_argument("--use_dpv", action="store_true", help="Use DPVAE instead of PCA+UMAP")
+    parser.add_argument("--latent_dim", type=int, default=2, help="DPVAE latent dimensions")
+    parser.add_argument("--hidden_dim", type=int, default=128, help="DPVAE hidden dimensions")
+    parser.add_argument("--trunc_K", type=int, default=20, help="DPVAE truncation parameter")
+    parser.add_argument("--dp_alpha", type=float, default=1.0, help="DPVAE Dirichlet Process alpha")
+    parser.add_argument("--batch_size", type=int, default=64, help="DPVAE batch size")
+    parser.add_argument("--epochs", type=int, default=50, help="DPVAE training epochs")
+    parser.add_argument("--lr", type=float, default=1e-3, help="DPVAE learning rate")
+
+    args = parser.parse_args()
+
+    if not args.use_dpv:
+        # Quick PCA + UMAP plotting
+        embeddings = np.load(args.embeddings_path)
+        load_and_plot_embeddings(embeddings, args.figures_dir)
+    else:
+        # Full DPVAE pipeline
+        main(
+            embeddings_path=args.embeddings_path,
+            figures_dir=args.figures_dir,
+            use_dpv=True,
+            dp_params={
+                "latent_dim": args.latent_dim,
+                "hidden_dim": args.hidden_dim,
+                "trunc_K": args.trunc_K,
+                "dp_alpha": args.dp_alpha
+            },
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lr=args.lr
+        )
 
