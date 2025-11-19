@@ -108,11 +108,12 @@ class BestAtThreshold(PredMetrics):
         tn, fp, fn, tp = confusion_matrix(labels, logits > threshold).ravel().tolist()
         metrics = {}
         metrics["threshold"] = threshold
-        metrics["precision"] = tp / (tp + fp)
-        metrics["recall"] = tp / (tp + fn)
+        metrics["precision"] = tp / (tp + fp + 1e-9)
+        metrics["recall"] = tp / (tp + fn + 1e-9)
         metrics["F1-score"] = (2 * metrics["precision"] * metrics["recall"]) / (
-            metrics["precision"] + metrics["recall"]
+            metrics["precision"] + metrics["recall"] + 1e-9
         )
+
         metrics["TN"] = tn
         metrics["FP"] = fp
         metrics["FN"] = fn

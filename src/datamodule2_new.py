@@ -13,7 +13,7 @@ import torch
 from flash_attn.bert_padding import unpad_input
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from src.collate_fn2 import (
+from src.collate_fn2_new import (
     Collate,
     AutoregressiveCollate,
     AutoregressivePredictCollate,
@@ -23,7 +23,7 @@ from src.collate_fn2 import (
     FamilyPredictCensorRegressionCollate,
     PredictCensorCollate,
 )
-from src.dataset import LMDBDataset, FinetuneLMDBDataset, FamilyFinetuneLMDBDataset
+from src.dataset_new import LMDBDataset, FinetuneLMDBDataset, FamilyFinetuneLMDBDataset
 from src.paths import FPATH, check_and_copy_file_or_dir
 from src.pipeline import DataPipeline
 from src.sampler import UnpadSampler
@@ -44,13 +44,11 @@ class BaseLightningDataModule(L.LightningDataModule):
         cohorts: dict = None,
         fill_nulls=False,
         subset_background=False,
-        sep_token=False,
         num_workers=0,
         n_tokens=8e5,
         max_seq_len=512,
         cutoff=0,
         source_dir=None,
-        lengths="lengths",
     ):
         super().__init__()
         # Init data related stuff
@@ -62,7 +60,6 @@ class BaseLightningDataModule(L.LightningDataModule):
         self.dir_path = dir_path
         check_and_copy_file_or_dir(self.dir_path, verbosity=2)
         self.source_dir = source_dir
-        self.lengths = lengths
 
         if (pipeline_path := dir_path / "pipeline.pt").exists():
             print("Loading pipeline")
@@ -70,7 +67,7 @@ class BaseLightningDataModule(L.LightningDataModule):
         else:
             self.pipeline = DataPipeline(
                 cls_token=False,
-                sep_token=sep_token,
+                sep_token=False,
                 fill_nulls=fill_nulls,
                 subset_background=subset_background,
                 cutoff=cutoff,
@@ -84,13 +81,13 @@ class BaseLightningDataModule(L.LightningDataModule):
         self.n_tokens = n_tokens
 
         # Init length-related stuff
-        self.background_length = get_background_length(background) + int(sep_token)
+        self.background_length = get_background_length(background)
         self.max_seq_len = max_seq_len
 
         self.prepared = 0
         # Avoid lint complaints
         self.dataset = None
-        self._lengths = None
+        self.lengths = None
         self.train_dataset, self.val_dataset = None, None
         self.predict_dataset, self.test_dataset = None, None
 
@@ -117,19 +114,7 @@ class BaseLightningDataModule(L.LightningDataModule):
             )
 
         # Define lengths for UnpadSampler
-        if self._lengths is None:
-            length_path = self.dir_path / (self.lengths + ".parquet")
-            check_and_copy_file_or_dir(length_path, verbosity=2)
-            if isinstance(self.lengths, str) and (length_path.exists()):
-                print(f'Info: Using unpadding lengths "{self.lengths}.parquet"')
-                self._lengths = pl.read_parquet(length_path).cast(
-                    {"person_id": pl.String}
-                )
-            else:
-                print(
-                    f"Warning: No {self.lengths}.parquet found - Using {self.max_seq_len} unpadding lengths"
-                )
-                self._lengths = [self.max_seq_len]
+        self.lengths = self.dataset.get_lengths()
 
         if self.cohorts is not None:
             for key, cohort in self.cohorts.items():
@@ -172,7 +157,7 @@ class BaseLightningDataModule(L.LightningDataModule):
     def get_dataloader(self, dataset: LMDBDataset, sampler=None):
         """Returns a generic DataLoader with given attributes from self and kwargs"""
         if self.num_workers == 0:
-            dataset._init_db()
+            dataset.init_db()
         return DataLoader(
             dataset,
             batch_size=None,
@@ -186,18 +171,8 @@ class BaseLightningDataModule(L.LightningDataModule):
 
     def get_sampler(self, dataset, sampler=None):
         """Returns a UnpadSampler"""
-        # If lengths.parquet, subset and re-order
-        if isinstance(self._lengths, pl.DataFrame):
-            pnrs = pl.from_dict({"person_id": dataset.observations["person_id"]}).cast(
-                {"person_id": pl.String}
-            )
-            subset = pnrs.join(self._lengths, on="person_id", how="left")
-            pnr_to_length = dict(zip(subset["person_id"], subset["length"]))
-            lengths = [
-                pnr_to_length[str(pnr)] for pnr in dataset.observations["person_id"]
-            ]
-        else:
-            lengths = self._lengths * len(dataset)
+        lengths = [self.lengths[str(pnr)] for pnr in dataset.observations["person_id"]]
+
         if sampler is None:
             sampler = list(range(len(dataset)))
             random.shuffle(sampler)
@@ -213,22 +188,26 @@ class BaseLightningDataModule(L.LightningDataModule):
         """Initializes the dataset"""
         worker_info = torch.utils.data.get_worker_info()
         dataset = worker_info.dataset
-        dataset._init_db()
+        dataset.init_db()
 
     def train_dataloader(self):
         """Returns the train dataloader for self.train_dataset"""
+        assert self.train_dataset is not None
         return self.get_dataloader(self.train_dataset)
 
     def val_dataloader(self):
         """Returns the val dataloader for self.val_dataset"""
+        assert self.val_dataset is not None
         return self.get_dataloader(self.val_dataset)
 
     def predict_dataloader(self):
         """Returns the prediction dataloader for self.predict_dataset"""
+        assert self.predict_dataset is not None
         return self.get_dataloader(self.predict_dataset)
 
     def test_dataloader(self):
         """Returns the test dataloader for self.test_dataset"""
+        assert self.test_dataset is not None
         return self.get_dataloader(self.test_dataset)
 
     def teardown(self, stage: str = None):
@@ -411,7 +390,6 @@ class PredictFinetuneLifeLDM(OutcomesBaseLDM):
 
     def on_after_batch_transfer(self, batch, dataloader_idx):
         batch["predict_tokens"] = batch["event"] == self.collate.predict_token_id
-        batch["og_event"] = batch["event"]  # TODO: Not ideal
         batch["og_abspos"] = batch["abspos"]  # TODO: Not ideal
         batch["og_age"] = batch["age"].round(decimals=2)  # TODO: Not ideal
         batch = super().on_after_batch_transfer(batch, dataloader_idx)

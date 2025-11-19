@@ -1,6 +1,7 @@
-import math
 import bisect
-from typing import List, Dict, Tuple
+import math
+from typing import Dict, List, Tuple
+
 import torch
 
 ONE_YEAR_ABSPOS = 365.25 * 24
@@ -74,7 +75,9 @@ def censor_data(
 
 def censor_person(person, outcome_info, background):
     """Removes events after the last_valid_date"""
-
+    assert set(person).issubset(
+        {"event", "age", "abspos"}
+    ), "Only event, age, and abspos allowed"
     abspos = person["abspos"]
     censor_abspos = outcome_info["censor"]
     # Since data is sorted by abspos, we can just do binary search

@@ -18,7 +18,7 @@ from sklearn.preprocessing import MaxAbsScaler, OneHotEncoder, StandardScaler
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchmetrics.classification import AUROC
 
-from src.loggers import RetryTensorBoardLogger
+from src.loggers import RetryOrSkipTensorBoardLogger, RetryTensorBoardLogger
 from src.paths import FPATH
 
 
@@ -161,6 +161,63 @@ class SparseDataModule(LightningDataModule):
             self.train_dataset,
             batch_size=self.batch_size,
             sampler=self.sampler,
+            num_workers=self.num_workers,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+        )
+
+
+class SparseRegressionDataModule(LightningDataModule):
+    """DataModule for loading sparse matrix data."""
+
+    def __init__(
+        self,
+        train_data: csr_matrix,
+        train_labels: np.ndarray,
+        val_data: csr_matrix,
+        val_labels: np.ndarray,
+        batch_size: int = 32,
+        num_workers=0,
+    ):
+        """
+        Args:
+            train_data (csr_matrix): The training feature data in sparse format.
+            train_labels (np.ndarray): The training target labels.
+            val_data (csr_matrix): The validation feature data in sparse format.
+            val_labels (np.ndarray): The validation target labels.
+            batch_size (int): Batch size for the DataLoader.
+        """
+        super().__init__()
+        self.train_data = train_data
+        self.train_labels = train_labels
+        self.val_data = val_data
+        self.val_labels = val_labels
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+    def setup(self, stage: str = None):
+        self.train_dataset = SparseDataset(self.train_data, self.train_labels)
+        self.val_dataset = SparseDataset(self.val_data, self.val_labels)
+
+        # # Compute class weights for balanced sampling
+        # label_counts = Counter(self.train_labels)
+        # class_weights = {label: 1.0 / count for label, count in label_counts.items()}
+        # sample_weights = [class_weights[label] for label in self.train_labels]
+        # self.sampler = WeightedRandomSampler(
+        #     sample_weights, num_samples=len(self.train_labels), replacement=True
+        # )
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
             num_workers=self.num_workers,
         )
 
@@ -337,7 +394,7 @@ class LogisticRegressionMSELoss(LightningModule):
         self.lr = lr
 
     def forward(self, x):
-        return torch.sigmoid(self.linear(x)).squeeze()
+        return self.linear(x).squeeze()
 
     def training_step(self, batch, batch_idx):
         x, y = batch
@@ -403,9 +460,9 @@ def objective_LR_MSELoss(
         float: Best model score achieved during training.
     """
     # Define the hyperparameters to tune
-    alpha = trial.suggest_float("alpha", 1e-4, 1e2, log=True)
+    alpha = trial.suggest_float("alpha", 1e-4, 1e-1, log=True)
     l1_ratio = trial.suggest_float("l1_ratio", 0.0, 1.0)
-    lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
+    lr = trial.suggest_float("lr", 1e-4, 1e-1, log=True)
 
     # Initialize DataModule and Model with hyperparameters from trial
     data_module = SparseDataModule(
@@ -426,7 +483,7 @@ def objective_LR_MSELoss(
     log_folder.mkdir(exist_ok=True, parents=True)
     checkpoint_folder = FPATH.CHECKPOINTS / "logistic_regression" / experiment_name
     checkpoint_folder.mkdir(exist_ok=True)
-    logger = RetryTensorBoardLogger(log_folder, name=outcome_name)
+    logger = RetryOrSkipTensorBoardLogger(log_folder, name=outcome_name)
     checkpoint_callback = ModelCheckpoint(
         monitor="val_loss",
         dirpath=checkpoint_folder,
@@ -485,7 +542,7 @@ class MLPRegressor(LightningModule):
             layers.append(nn.Linear(in_f, out_f))
             if out_f != 1:
                 layers.append(nn.ReLU())
-        layers.append(nn.Sigmoid())
+        # layers.append(nn.Sigmoid())
         self.model = nn.Sequential(*layers)
 
         self.alpha = alpha
@@ -589,11 +646,9 @@ def objective_MLP(
     """
     # Define the hyperparameters to tune
     n_layers = trial.suggest_int("n_layers", 1, 5)
-    hidden_dims = [
-        trial.suggest_int(f"n_units_l{i}", 16, 256, log=True) for i in range(n_layers)
-    ]
-    lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
-    alpha = trial.suggest_float("alpha", 0.0, 1.0)
+    hidden_dims = [trial.suggest_int(f"n_units_l{i}", 16, 256) for i in range(n_layers)]
+    lr = trial.suggest_float("lr", 1e-4, 1e-1, log=True)
+    alpha = trial.suggest_float("alpha", 1e-4, 1e-1, log=True)
     l1_ratio = trial.suggest_float("l1_ratio", 0.0, 1.0)
 
     # Initialize DataModule and Model with hyperparameters from trial
@@ -621,7 +676,7 @@ def objective_MLP(
     checkpoint_folder = FPATH.CHECKPOINTS / "mlp" / experiment_name
     checkpoint_folder.mkdir(exist_ok=True)
 
-    logger = RetryTensorBoardLogger(log_folder, name=outcome_name)
+    logger = RetryOrSkipTensorBoardLogger(log_folder, name=outcome_name)
     checkpoint_callback = ModelCheckpoint(
         monitor="val_loss",
         dirpath=checkpoint_folder,

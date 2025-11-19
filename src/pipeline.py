@@ -13,8 +13,7 @@ from src.features import (
 )
 from src.paths import FPATH
 from src.tokenize import create_vocab
-from src.utils import get_pnrs, print_main
-from src.log_data import create_data_creation_directory, setup_data_creation_logger
+from src.utils import get_pnrs
 
 
 class DataPipeline:
@@ -27,23 +26,17 @@ class DataPipeline:
         fill_nulls: bool = False,
         subset_background: bool = False,
         cutoff: int = 0,
-        time_encoding: str = "time2vec",
-        enable_logging: bool = True,
     ):
         self.cls_token = cls_token
         self.sep_token = sep_token
         self.fill_nulls = fill_nulls
         self.subset_background = subset_background
         self.cutoff = cutoff
-        self.time_encoding = time_encoding
-        self.enable_logging = enable_logging
 
         # Assigned during __call__
         self.dir_path = None
         self.source_dir = None
         self.vocab = None
-        self.log_dir = None
-        self.logger = None
 
     def __call__(
         self,
@@ -58,17 +51,6 @@ class DataPipeline:
         ), "Required cols: person_id, date_col"
         self.dir_path = dir_path
         self.source_dir = source_dir
-
-        # Setup logging if enabled
-        if self.enable_logging:
-            # Convert to Path objects if they're strings
-            source_dir_path = Path(source_dir) if isinstance(source_dir, str) else source_dir
-            dir_path_path = Path(dir_path) if isinstance(dir_path, str) else dir_path
-
-            dataset_name = f"{source_dir_path.name}_{dir_path_path.name}" if source_dir_path and dir_path_path else "dataset"
-            self.log_dir = create_data_creation_directory(dataset_name)
-            self.logger = setup_data_creation_logger(self.log_dir, dataset_name)
-            self.logger.info(f"Starting data processing with time_encoding={self.time_encoding}")
         # Subset background on sources
         if self.subset_background:
             background = self.get_background_subset(sources, background)
@@ -104,7 +86,7 @@ class DataPipeline:
     @staticmethod
     def _load_if_exists(path: Path, backend=None):
         if path.exists():
-            print_main("Loading", path.stem)
+            # print("Loading", path.stem)
             if path.suffix == ".parquet":
                 if backend == "arrow":
                     return ds.dataset(path, format="parquet")
@@ -120,7 +102,7 @@ class DataPipeline:
             else:
                 raise ValueError("Only .parquet and .json files allowed")
         else:
-            print_main("Creating", path.stem)
+            print("Creating", path.stem)
             return None
 
     def get_background_subset(
@@ -147,13 +129,9 @@ class DataPipeline:
         vocab_path = self.dir_path / "vocab.json"
 
         if (vocab := self._load_if_exists(vocab_path)) is None:
-            vocab = create_vocab(sources, cutoff=self.cutoff, time_encoding=self.time_encoding)
+            vocab = create_vocab(sources, cutoff=self.cutoff)
             with open(vocab_path, "w", encoding="utf-8") as f:
                 json.dump(vocab, f)
-
-            # Log vocabulary creation
-            if self.logger:
-                self.logger.info(f"Created vocabulary with {len(vocab)} tokens using {self.time_encoding} encoding")
         return vocab
 
     def get_tokenized_event(
@@ -163,9 +141,7 @@ class DataPipeline:
         # Tokenize parquet is moved to network to conserve space on local IO
         tokenized_path_local = self.dir_path / "tokenized.parquet"
         tokenized_path_network = (
-            FPATH.NETWORK_DATA
-            / self.source_dir
-            / f"{self.dir_path.name}_tokenized.parquet"
+            FPATH.NETWORK_DATA / self.source_dir / f"{self.dir_path.name}.parquet"
         )
         # Load first from network IO
         if (
@@ -186,11 +162,5 @@ class DataPipeline:
                     sep_token=self.sep_token,
                     dir_path=self.dir_path,
                     fill_nulls=self.fill_nulls,
-                    time_encoding=self.time_encoding,
-                    log_dir=self.log_dir,
                 )  # tokenized_event is saved within create_tokenized_events function
-
-                # Log tokenized event creation
-                if self.logger:
-                    self.logger.info(f"Created tokenized events with {self.time_encoding} encoding")
         return tokenized_event

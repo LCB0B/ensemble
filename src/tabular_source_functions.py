@@ -8,9 +8,12 @@ import functools  # noqa: E402
 import json  # noqa: E402
 import time  # noqa: E402
 from datetime import datetime  # noqa: E402
-from typing import Any, Callable  # noqa: E402
+from pathlib import Path
+from typing import Any, Callable, Union  # noqa: E402
 
 import polars as pl  # noqa: E402
+import pyarrow as pa
+import pyarrow.parquet as pq
 from loguru import logger as default_logger  # noqa: E402
 from tqdm import tqdm
 
@@ -28,13 +31,6 @@ from src.tabular_preprocessing import (  # noqa: E402
     group_values_multiple,
 )
 
-from pathlib import Path
-from typing import Union
-
-import polars as pl
-import pyarrow as pa
-import pyarrow.parquet as pq
-from tqdm import tqdm
 
 def create_timing_decorator(log: Any = default_logger) -> Callable:
     """
@@ -450,10 +446,10 @@ def preprocess_sygesik(
     force_copy: bool = False,
 ) -> None:
     """
-    Load, transform, and save the LMDB dataset filtered by person IDs and years.
+    Load, transform, and save the sygesik dataset filtered by person IDs and years.
 
     Args:
-        filename (str): Base filename (e.g., "lmdb_DUMP") without extension.
+        filename (str): Base filename (e.g., "sygesik_DUMP") without extension.
         person_ids (list[int]): List of person IDs used for filtering the DataFrame.
         years (list[int]): List of years used for processing the DataFrame.
         folder (str): Folder name under FPATH.DATA where the output file will be saved.
@@ -893,7 +889,28 @@ def preprocess_kraf(
     df_crimes = df_kraf[["person_id", "afgoedto", "ger7", "afgtyp3"]]
     no_convictions_frames = []
     convictions_frames = []
-    free_cols = [0, 514, 518, 519]
+    lst = [
+        0,
+        range(311, 414 + 1),
+        421,
+        422,
+        423,
+        424,
+        431,
+        432,
+        433,
+        434,
+        514,
+        515,
+        550,
+        551,
+        552,
+        555,
+        556,
+    ]
+    free_cols = [
+        x for item in lst for x in (item if isinstance(item, range) else [item])
+    ]
     for year in years:
         previous_events = df_crimes.filter(pl.col("afgoedto").dt.year() < year)
         # No convictions (e.g., 'Frifundet')
@@ -1019,7 +1036,28 @@ def preprocess_krko(
         previous_events = df_confederated_cases.filter(
             pl.col("afg_afgoedto").dt.year() < year
         )
-        free_cols = [0, 11, 514, 518, 519]
+        lst = [
+            0,
+            range(311, 414 + 1),
+            421,
+            422,
+            423,
+            424,
+            431,
+            432,
+            433,
+            434,
+            514,
+            515,
+            550,
+            551,
+            552,
+            555,
+            556,
+        ]
+        free_cols = [
+            x for item in lst for x in (item if isinstance(item, range) else [item])
+        ]
         confederated_no_convictions = previous_events.filter(
             pl.col("afgtypko").is_in(free_cols)
         )
@@ -1685,7 +1723,7 @@ def preprocess_smdb_ibib(
         FPATH.DUMP_DIR / f"{filename}.parquet", person_ids, force_copy=force_copy
     )
 
-    print('SMDB IBIB shape', df_ibib.shape)
+    print("SMDB IBIB shape", df_ibib.shape)
 
     ibib_dataframes = []
     for year in years:
@@ -1971,14 +2009,13 @@ def preprocess_family_information(
     FPATH.alternative_copy_to_opposite_drive(output_file)
 
 
-
-def merge_parquet_outputs(base_output_folder: Path, n_groups: int) -> None:
+def merge_parquet_outputs_sources(base_output_folder: Path, n_groups: int) -> None:
     """
-    Merge same-named parquet files from multiple chunked output folders using PyArrow.
+    Merge same-named parquet files from chunked output folders using PyArrow with dtype promotion.
 
     Args:
-        base_output_folder (Path): Folder to write merged outputs into.
-        n_groups (int): Number of chunked folders to merge (e.g., suffixes _0, _1, ..., _n).
+        base_output_folder (Path): Output folder for merged parquet files.
+        n_groups (int): Number of chunk folders (e.g., 0 to n-1).
     """
     all_files = set()
     for i in range(n_groups):
@@ -1989,23 +2026,52 @@ def merge_parquet_outputs(base_output_folder: Path, n_groups: int) -> None:
     output_folder.mkdir(exist_ok=True)
 
     for fname in tqdm(sorted(all_files), desc="Merging files"):
+        col_types: dict[str, pl.DataType] = {}
+
+        # Step 1: Determine common supertype for each column
+        for i in range(n_groups):
+            fpath = base_output_folder.parent / f"{base_output_folder.name}_{i}" / fname
+            if fpath.exists():
+                df = pl.read_parquet(fpath)
+                for col in df.columns:
+                    dtype = df[col].dtype
+                    if col in col_types:
+                        # Create dummy series to promote dtypes
+                        s1 = pl.Series("", [], col_types[col])
+                        s2 = pl.Series("", [], dtype)
+                        promoted = (
+                            pl.select(pl.coalesce([s1, s2]).alias("tmp"))
+                            .get_column("tmp")
+                            .dtype
+                        )
+                        col_types[col] = promoted
+                    else:
+                        col_types[col] = dtype
+
+        all_columns = list(col_types.keys())
         writer: Union[pq.ParquetWriter, None] = None
         output_path = output_folder / fname
 
         for i in range(n_groups):
-            group_path = (
-                base_output_folder.parent / f"{base_output_folder.name}_{i}" / fname
-            )
-            if not group_path.exists():
+            fpath = base_output_folder.parent / f"{base_output_folder.name}_{i}" / fname
+            if not fpath.exists():
                 continue
 
-            batch_df = pl.read_parquet(group_path).to_arrow()
+            df = pl.read_parquet(fpath)
+
+            # Add missing columns
+            for col in all_columns:
+                if col not in df.columns:
+                    df = df.with_columns(pl.lit(None).cast(col_types[col]).alias(col))
+
+            # Cast to final schema
+            df = df.select([df[col].cast(col_types[col]) for col in all_columns])
+
+            table = df.to_arrow()
             if writer is None:
-                writer = pq.ParquetWriter(output_path, batch_df.schema)
+                writer = pq.ParquetWriter(output_path, table.schema)
 
-            writer.write_table(batch_df)
-
-            del batch_df
+            writer.write_table(table)
 
         if writer is not None:
             writer.close()

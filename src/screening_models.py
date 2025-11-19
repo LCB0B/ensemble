@@ -1,7 +1,10 @@
 import torch
 import lightning.pytorch as pl
 from collections import defaultdict
-from src.encoder_nano_risk import RiskPredictionFinetuneNanoEncoder
+from src.encoder_nano_risk import (
+    RiskPredictionFinetuneNanoEncoder,
+    FamilyRiskPredictionFinetuneNanoEncoder,
+)
 
 
 class BaseScreeningModel(pl.LightningModule):
@@ -28,8 +31,8 @@ class BaseScreeningModel(pl.LightningModule):
     def get_prediction_inputs(self, batch):
         grid_abspos = torch.nn.utils.rnn.pad_sequence(
             [
-                row[mask]
-                for row, mask in zip(batch["og_abspos"], batch["predict_tokens"])
+                row[grid]
+                for row, grid in zip(batch["og_abspos"], batch["predict_tokens"])
             ],
             batch_first=True,
             padding_value=torch.inf,
@@ -72,7 +75,7 @@ class BaseScreeningModel(pl.LightningModule):
         edt[outcome.isnan()] = torch.nan
 
         # Get terminal states
-        row_indices = torch.arange(actions.size(1), device=self.device).unsqueeze(0)
+        row_indices = torch.arange(actions.size(1), device=indices.device).unsqueeze(0)
         terminal = row_indices > indices.unsqueeze(-1)
 
         return edt, terminal
@@ -118,6 +121,7 @@ class RiskScreeningModel(BaseScreeningModel):
     def __init__(self, *args, **kwargs):
         super().__init__()
         self.risk_threshold = self.hparams.risk_threshold
+        self.time_window = 1
 
         self.risk_model = RiskPredictionFinetuneNanoEncoder(**self.hparams).eval()
 
@@ -132,5 +136,17 @@ class RiskScreeningModel(BaseScreeningModel):
     def get_states(self, batch):
         with torch.no_grad():
             x = self.risk_model.predict_step(batch, None)
-            x = x[:, :, 1]
+            x = x[:, :, self.time_window]
+
         return x
+
+    def predict_step(self, batch, batch_idx):
+        x = self.risk_model.predict_step(batch, None)
+        x = x[:, :, self.time_window]
+        return x
+
+
+class FamilyRiskScreeningModel(RiskScreeningModel):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.risk_model = FamilyRiskPredictionFinetuneNanoEncoder(**self.hparams).eval()

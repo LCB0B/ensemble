@@ -1,15 +1,15 @@
 """ Implements all collate functionality """
 
-from typing import Dict, List, Literal, Tuple, Union
+from typing import Dict, List, Tuple, Union, Literal
 
 import torch
 
-from src.collate_utils import (
+from src.collate_utils_new import (
     calc_age_from_abspos,
+    find_censor_idx,
     censor_data,
     censor_person,
     combine_and_sort_family_seq,
-    mask_inputs,
 )
 
 
@@ -39,11 +39,17 @@ class Collate:
         """Post-processes output"""
         return output
 
+    @staticmethod
+    def gather_person(batch: Dict, idx: int):
+        """Gathers a Dict[key, val[idx]]"""
+        return {key: val[idx] for key, val in batch.items()}
+
     def main(self, batch: Dict[str, List[dict]]) -> dict:
         """The main processing function"""
         output = {key: [] for key in self.data_keys}
 
-        for person in batch["data"]:
+        for i in range(len(batch["data"])):
+            person = self.gather_person(batch, i)
             indv = self.process_person(person)
             for key, v in indv.items():
                 output[key].append(v)
@@ -57,64 +63,64 @@ class Collate:
     def process_person(self, person, truncate_length: int = None):
         """Handles all person-specific processsing"""
         output = {}
-        truncate_length = (
-            truncate_length if truncate_length is not None else self.truncate_length
-        )
-        # Start with events
-        person_seq, person_event_lens, event_border = self._flatten(
-            person.pop("event"),
-            truncate_length=truncate_length,
-        )
-        output["event"] = person_seq
 
-        person["segment"] = list(range(1, len(person_event_lens) + 1))
-        # Add rest of keys
-        repeats = torch.as_tensor(person_event_lens)
-        for key in person:
-            truncated_seq = self._truncate(person[key], event_border)
-            expanded_seq = self.expand(truncated_seq, repeats)
-            output[key] = expanded_seq
+        trunc_idx = self.find_truncation_idx(
+            person["event_lengths"],
+            truncate_length=(
+                truncate_length if truncate_length is not None else self.truncate_length
+            ),
+        )
+
+        trunc_event_lengths = self.truncate(person["event_lengths"], trunc_idx)
+        trunc_event_lengths = torch.tensor(trunc_event_lengths, dtype=torch.int32)
+        event_idxs = torch.repeat_interleave(trunc_event_lengths)
+
+        person["data"]["segment"] = list(range(1, len(trunc_event_lengths) + 1))
+        for key in self.data_keys:
+            trunc_seq = self.truncate(person["data"][key], trunc_idx)
+            if key == "event":
+                seq = self.flatten(trunc_seq)
+            else:
+                seq = self.expand(trunc_seq, event_idxs)
+            output[key] = seq
         return output
 
-    def _truncate(self, seq: list, event_border: int):
-        if event_border is None:
+    def find_truncation_idx(
+        self, event_lengths: List[int], truncate_length: int
+    ) -> Union[None, int]:
+        """Find the trucation index (returns None if not present)"""
+        if (
+            len(event_lengths) < truncate_length  # Small optimization
+            and sum(event_lengths) < truncate_length
+        ):
+            return None
+
+        n = 0
+        for i, count in enumerate(reversed(event_lengths)):
+            n += count
+            if n > truncate_length:
+                break
+        else:
+            return None
+        return -i
+
+    def truncate(self, seq: list, idx: int) -> list:
+        """Truncates `seq` based on `idx`, keeping background if present"""
+        if idx is None:
             return seq
-        return seq[: self.bg_events] + seq[event_border:]
+        return seq[: self.bg_events] + seq[idx:]
 
     @staticmethod
-    def expand(seq: list, repeats: torch.Tensor) -> torch.Tensor:
-        """Repeats seq[i] repeats[i] times"""
+    def flatten(seq: List[list]) -> list:
+        """Flattens `seq`"""
+        return [e for sublist in seq for e in sublist]
+
+    @staticmethod
+    def expand(seq: list, event_idxs: torch.Tensor) -> torch.Tensor:
+        """Expands `seq` using indexing via. `event_idxs`"""
         dtype = torch.int32 if isinstance(seq[0], int) else torch.float32
-        return torch.repeat_interleave(torch.as_tensor(seq, dtype=dtype), repeats)
-
-    def _flatten(self, events: List[List[int]], truncate_length: int):
-        """Flattens events and (optional) truncates, returning flatten_seq and the last event idx"""
-        person_seq, person_event_lens, event_border = (
-            self._flatten_reverse_and_truncate(events, truncate_length)
-        )
-        return person_seq, person_event_lens, event_border
-
-    def _flatten_reverse_and_truncate(
-        self, sequence: List, truncate_length: int
-    ) -> Tuple[list, list, int]:
-        """Flattens a reversed list (keeping newest info) until truncate_length reached, adds background and then returns event_idx (if terminated) and list"""
-        result, event_lens = [], []
-        total_length = 0
-        for i, sublist in enumerate(reversed(sequence)):
-            n = len(sublist)
-            total_length += n
-            if total_length > truncate_length:
-                break
-            event_lens.append(n)
-            result.extend(sublist[::-1])
-        else:  # If loop finished (total_length < truncate_length)
-            return result[::-1], event_lens[::-1], None
-
-        # Add background onto it
-        for sublist in reversed(sequence[: self.bg_events]):
-            result.extend(sublist[::-1])
-            event_lens.append(len(sublist))
-        return result[::-1], event_lens[::-1], -i
+        seq = torch.as_tensor(seq, dtype=dtype)
+        return seq[event_idxs]
 
     def _pad(
         self,
@@ -131,36 +137,6 @@ class Collate:
         ).to(dtype)
 
 
-class MaskCollate(Collate):
-    """Standard collate with masking"""
-
-    def __init__(
-        self,
-        *args,
-        vocab: dict,
-        mask_prob=0.15,
-        replace_prob=0.8,
-        random_prob=0.1,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
-        self.vocab = vocab
-        self.mask_prob = mask_prob
-        self.replace_prob = replace_prob
-        self.random_prob = random_prob
-
-    def post_main(self, output, batch=None):
-        # Mask events and produce targets
-        output["event"], output["target"] = mask_inputs(
-            output["event"],
-            self.vocab,
-            mask_prob=self.mask_prob,
-            replace_prob=self.replace_prob,
-            random_prob=self.random_prob,
-        )
-        return output
-
-
 class AutoregressiveCollate(Collate):
     """Standard collate with Autoregressive shift"""
 
@@ -169,14 +145,14 @@ class AutoregressiveCollate(Collate):
         output["target"] = output["target"].masked_fill(output["target"] == 0, -100)
         for feature in ["event", "abspos", "age", "segment"]:
             output[feature] = output[feature][:, :-1]
-        return output
+        return super().post_main(output, batch)
 
 
 class CensorCollate(Collate):
     """Standard collate with censoring"""
 
     def pre_main(self, batch):
-        batch["data"] = self._censor_data(batch)
+        batch = self._censor_data(batch)
         return super().pre_main(batch)
 
     def post_main(self, output, batch):
@@ -188,9 +164,20 @@ class CensorCollate(Collate):
         return output
 
     def _censor_data(self, batch):
-        return censor_data(
-            batch["data"], batch["outcome_info"], background=self.bg_events
-        )
+        for i in range(len(batch["data"])):
+            censor_idx = find_censor_idx(
+                batch["data"][i]["abspos"],
+                batch["outcome_info"][i]["censor"],
+                background=self.bg_events,
+            )
+            batch["data"][i] = {
+                key: value[:censor_idx] for key, value in batch["data"][i].items()
+            }
+            batch["event_lengths"][i] = batch["event_lengths"][i][:censor_idx]
+        return batch
+        # return censor_data(
+        #     batch["data"], batch["outcome_info"], background=self.bg_events
+        # )
 
 
 class PredictCollate(Collate):
@@ -200,74 +187,101 @@ class PredictCollate(Collate):
         super().__init__(*args, **kwargs)
         self.predict_token_id = predict_token_id
 
-    def pre_main(self, batch):
-        batch = self.add_predict_info(batch)
-        return super().pre_main(batch)
-
-    def add_predict_info(self, batch):
-        for person, outcome in zip(batch["data"], batch["outcome_info"]):
-            person["predict"] = outcome["predict"]
-        return batch
-
     def process_person(self, person, truncate_length: int = None):
-        """Handles all person-specific processsing"""
-        output = {}
-        truncate_length = (
-            truncate_length if truncate_length is not None else self.truncate_length
-        )
-
-        # Start with events
-        person_seq, person_event_lens, event_border = self._flatten(
-            person["event"],
-            truncate_length=truncate_length - len(person["predict"]),
-        )
-
-        # Add rest of keys
-        for key in self.data_keys:
-            if key == "segment":
-                continue
-            truncated_seq = self._truncate(person[key], event_border)
-            output[key] = truncated_seq
-
-        output["event_lens"] = person_event_lens
-        output = self.add_predict_tokens_to_person(output, person["predict"])
-        person_event_lens = output.pop("event_lens")
-
-        output["segment"] = list(range(1, len(person_event_lens) + 1))
-
-        # Expand in the end (easier grid token sort and segment creation)
-        repeats = torch.as_tensor(person_event_lens)
-        for key in output:
-            if key == "event":
-                output[key] = torch.as_tensor(sum(output[key], []), dtype=torch.int32)
-            else:
-                output[key] = self.expand(output[key], repeats)
+        person = self.add_predict_tokens_to_person(person)
+        output = super().process_person(person, truncate_length=truncate_length)
+        output = self.sort_by_abspos(output)
         return output
 
-    def add_predict_tokens_to_person(self, person, predictions):
+    def add_predict_tokens_to_person(self, person):
         """Adds a PREDICT token (self.predict_token_id used) to the person for every prediction"""
-        person = self.add_predict_features_to_person(person, predictions)
-
-        sorted_idxs = sorted(
-            range(len(person["abspos"])), key=lambda i: person["abspos"][i]
+        prediction_abspos = person["outcome_info"]["predict"]
+        person["data"] = self.add_predict_data_to_person(
+            person["data"], prediction_abspos
         )
+        person["event_lengths"].extend([1] * len(prediction_abspos))
+        return person
 
-        return {key: [value[i] for i in sorted_idxs] for key, value in person.items()}
-
-    def add_predict_features_to_person(self, person, predictions):
+    def add_predict_data_to_person(self, person, predictions):
         """Adds predict-related features to person"""
         person["event"].extend([[self.predict_token_id] for _ in predictions])
         person["abspos"].extend(predictions)
         person["age"].extend(
             [calc_age_from_abspos(person["abspos"][0], a) for a in predictions]
         )
-        person["event_lens"].extend([1] * len(predictions))
         return person
+
+    @staticmethod
+    def sort_by_abspos(output: Dict[str, list]):
+        """Sort all keys in output by the `abspos`"""
+        sorted_idxs = sorted(
+            range(len(output["abspos"])), key=lambda i: output["abspos"][i]
+        )
+
+        return {key: [value[i] for i in sorted_idxs] for key, value in output.items()}
+
+
+class FamilyCollate(Collate):
+    """
+    Family-aware collate that uses prediction windows for censoring.
+    feature_set (list): List of family types to include (e.g. ["Child", "Mother"])
+    """
+
+    family_type = {"Child": 1, "Father": 2, "Mother": 3}
+
+    def __init__(self, *args, feature_set: List[str], **kwargs):
+        super().__init__(*args, **kwargs)
+        self.feature_set = feature_set
+        self.process_set = feature_set
+        self.data_keys += ["family_type"]
+
+    def pre_main(self, batch):
+        batch = super().pre_main(batch)
+        for family, outcome in zip(batch["data"], batch["outcome_info"]):
+            if "relations" in outcome:
+                family["length_dict"] = {
+                    val["relations"]: val["adjusted_lengths"]
+                    for val in outcome["relations"]
+                }
+        return batch
+
+    def process_person(self, family, truncate_length=None):
+        family_seq = []
+        length_dict = family.pop("length_dict", None)
+        for typ, person in family.items():
+            if typ not in self.process_set:
+                continue
+            truncate_length = (
+                length_dict[typ] - self.background_length
+                if (len(self.feature_set) > 1)
+                and (length_dict[typ] <= self.truncate_length)
+                else self.truncate_length
+            )
+            person["family_type"] = [self.family_type[typ]] * len(person["event"])
+            if typ == "Child":
+                indv = self.process_child(person, truncate_length)
+            else:
+                indv = self.process_parent(person, truncate_length)
+
+            family_seq.append(indv)
+
+        combined = combine_and_sort_family_seq(family_seq)
+        return combined
+
+    def process_child(self, person, truncate_length):
+        return super().process_person(person, truncate_length)
+
+    def process_parent(self, person, truncate_length):
+        return super().process_person(person, truncate_length)
 
 
 class AutoregressivePredictCollate(PredictCollate, AutoregressiveCollate):
     """Autoregressive with Predict tokens"""
 
+    pass
+
+
+class AutoregressiveCensorPredictCollate(CensorCollate, AutoregressivePredictCollate):
     pass
 
 
@@ -278,7 +292,7 @@ class PredictCensorCollate(CensorCollate, PredictCollate):
         self,
         *args,
         prediction_windows: list,
-        padding_side: Literal["left", "right"] = "left",
+        padding_side: Literal["left", "right"] = None,
         **kwargs,
     ):
         PredictCollate.__init__(self, *args, **kwargs)
@@ -312,45 +326,6 @@ class PredictCensorCollate(CensorCollate, PredictCollate):
             ) >= outcome["outcome"]
             outcome["target"] = target
         return outcome_info
-
-
-class FamilyCollate(Collate):
-    """
-    Family-aware collate that uses prediction windows for censoring.
-    feature_set (list): List of family types to include (e.g. ["Child", "Mother"])
-    """
-
-    family_type = {"Child": 1, "Father": 2, "Mother": 3}
-
-    def __init__(self, *args, feature_set: List[str], **kwargs):
-        super().__init__(*args, **kwargs)
-        self.feature_set = feature_set
-        self.process_set = feature_set
-        self.data_keys += ["family_type"]
-
-    def process_person(self, family, truncate_length=None):
-        family_seq = []
-        valid_family = [key for key in family if key in self.feature_set]
-        truncate_length = self.max_seq_len // len(valid_family) - self.background_length
-        for typ, person in family.items():
-            if typ not in self.process_set:
-                continue
-            person["family_type"] = [self.family_type[typ]] * len(person["event"])
-            if typ == "Child":
-                indv = self.process_child(person, truncate_length)
-            else:
-                indv = self.process_parent(person, truncate_length)
-
-            family_seq.append(indv)
-
-        combined = combine_and_sort_family_seq(family_seq)
-        return combined
-
-    def process_child(self, person, truncate_length):
-        return super().process_person(person, truncate_length)
-
-    def process_parent(self, person, truncate_length):
-        return super().process_person(person, truncate_length)
 
 
 class FamilyPredictCensorCollate(FamilyCollate, PredictCensorCollate):
@@ -467,6 +442,9 @@ class FamilyCensorAutoregressivePredictCollate(
         return AutoregressivePredictCollate.process_person(
             self, person, truncate_length
         )
+
+    def process_parent(self, person, truncate_length):
+        return Collate.process_person(self, person, truncate_length)
 
     def add_predict_features_to_person(self, person, predictions):
         person = super().add_predict_features_to_person(person, predictions)

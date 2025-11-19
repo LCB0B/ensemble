@@ -13,7 +13,7 @@ from tqdm import tqdm
 from src.utils import get_pnrs
 
 
-def yield_chunks(sources: Union[ds.Dataset, List[ds.Dataset]], chunk_size=100_000):
+def yield_chunks(sources: Union[ds.Dataset, List[ds.Dataset]], chunk_size=10_000):
     """Yields chunks (pl.DataFrame) from sources (ds.Dataset)"""
     pnrs = get_pnrs(sources)
 

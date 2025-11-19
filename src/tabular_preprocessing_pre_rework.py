@@ -702,7 +702,7 @@ def prepare_dataframe_no_temporal_splitting(
     for col in count_cols:
         df_filtered = df_filtered.with_columns(pl.col(col).fill_null("").cast(pl.Utf8))
 
-    return df_filtered  # .to_pandas()
+    return df_filtered.to_pandas()
 
 
 def describe_parquet_files(logger, folder: str, missing_threshold: float) -> None:
@@ -836,41 +836,22 @@ def normalize_columns(df: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
     )
 
 
-# def winsorize(
-#     df: pd.DataFrame, col_bounds: dict[str, tuple[float, float]]
-# ) -> pd.DataFrame:
-#     """
-#     Applies winsorization to numerical columns based on provided bounds.
-
-#     Args:
-#         df (pd.DataFrame): DataFrame to transform.
-#         col_bounds (dict[str, tuple[float, float]]): Lower and upper bounds for each column.
-
-#     Returns:
-#         pd.DataFrame: Transformed DataFrame.
-#     """
-#     df = df.copy()
-#     for col, (lo, hi) in col_bounds.items():
-#         df.loc[:, col] = df[col].clip(lower=lo, upper=hi)
-#     return df
-
-# import polars as pl
-
-
 def winsorize(
-    df: pl.DataFrame, col_bounds: dict[str, tuple[float, float]]
-) -> pl.DataFrame:
+    df: pd.DataFrame, col_bounds: dict[str, tuple[float, float]]
+) -> pd.DataFrame:
     """
     Applies winsorization to numerical columns based on provided bounds.
 
     Args:
-        df (pl.DataFrame): DataFrame to transform.
+        df (pd.DataFrame): DataFrame to transform.
         col_bounds (dict[str, tuple[float, float]]): Lower and upper bounds for each column.
+
+    Returns:
+        pd.DataFrame: Transformed DataFrame.
     """
+    df = df.copy()
     for col, (lo, hi) in col_bounds.items():
-        df = df.with_columns(
-            pl.col(col).clip(lower_bound=lo, upper_bound=hi).alias(col)
-        )
+        df.loc[:, col] = df[col].clip(lower=lo, upper=hi)
     return df
 
 
@@ -1274,23 +1255,23 @@ def process_tabular_data_random_splitting(
     del df_combined
 
     loguru_logger.info("Saving all-info parquet files")
-    df_test = df_prepared.filter(pl.col("person_id").is_in(test_person_ids))
-    df_train = df_prepared.filter(pl.col("person_id").is_in(train_person_ids))
-    df_val = df_prepared.filter(pl.col("person_id").is_in(val_person_ids))
+    df_test = df_prepared[df_prepared["person_id"].isin(test_person_ids)]
+    df_train = df_prepared[df_prepared["person_id"].isin(train_person_ids)]
+    df_val = df_prepared[df_prepared["person_id"].isin(val_person_ids)]
 
     del df_prepared
 
     save_and_copy(
         FPATH.DATA / data_folder / f"{output_prefix}_test_all_info.parquet",
-        lambda p: df_test.write_parquet(p),  # noqa: F821
+        lambda p: df_test.to_parquet(p),
     )
     save_and_copy(
         FPATH.DATA / data_folder / f"{output_prefix}_train_all_info.parquet",
-        lambda p: df_train.write_parquet(p),  # noqa: F821
+        lambda p: df_train.to_parquet(p),
     )
     save_and_copy(
         FPATH.DATA / data_folder / f"{output_prefix}_val_all_info.parquet",
-        lambda p: df_val.write_parquet(p),  # noqa: F821
+        lambda p: df_val.to_parquet(p),
     )
 
     loguru_logger.info("Winsorizing numerical columns")
@@ -1309,39 +1290,21 @@ def process_tabular_data_random_splitting(
 
     loguru_logger.info("Extracting feature matrices and targets")
     X_test, y_test = df_test[included_cols], df_test["target"]
-    del df_test
     X_train, y_train = df_train[included_cols], df_train["target"]
-    del df_train
     X_val, y_val = df_val[included_cols], df_val["target"]
-    del df_val
-
-    loguru_logger.info("Saving target arrays")
-    save_and_copy(
-        FPATH.DATA / data_folder / f"{output_prefix}_train_y.npy",
-        lambda p: np.save(p, y_train.to_numpy()),  # noqa: F821
-    )
-    save_and_copy(
-        FPATH.DATA / data_folder / f"{output_prefix}_val_y.npy",
-        lambda p: np.save(p, y_val.to_numpy()),  # noqa: F821
-    )
-    save_and_copy(
-        FPATH.DATA / data_folder / f"{output_prefix}_test_y.npy",
-        lambda p: np.save(p, y_test.to_numpy()),  # noqa: F821
-    )
-    del y_train, y_val, y_test
 
     loguru_logger.info("Saving dense feature matrices")
     save_and_copy(
         FPATH.DATA / data_folder / f"{output_prefix}_train_dense.parquet",
-        lambda p: X_train.write_parquet(p),  # noqa: F821
+        lambda p: X_train.to_parquet(p),
     )
     save_and_copy(
         FPATH.DATA / data_folder / f"{output_prefix}_val_dense.parquet",
-        lambda p: X_val.write_parquet(p),  # noqa: F821
+        lambda p: X_val.to_parquet(p),
     )
     save_and_copy(
         FPATH.DATA / data_folder / f"{output_prefix}_test_dense.parquet",
-        lambda p: X_test.write_parquet(p),  # noqa: F821
+        lambda p: X_test.to_parquet(p),
     )
 
     loguru_logger.info("Fitting sparse pipeline and transforming data")
@@ -1351,54 +1314,16 @@ def process_tabular_data_random_splitting(
     pipeline = create_sparse_pipeline(
         numerical_cols, onehot_cols, count_cols, min_df, max_count
     )
-
-    loguru_logger.info("Convert to pd: Train")
-    X_train_pd = X_train.to_pandas()
+    train_arr = ensure_csr(pipeline.fit_transform(X_train))
     del X_train
-
-    loguru_logger.info("Pipeline: Train")
-    train_arr = ensure_csr(pipeline.fit_transform(X_train_pd))
-    del X_train_pd
-
-    loguru_logger.info("Saving: Train")
-    save_and_copy(
-        FPATH.DATA / data_folder / f"{output_prefix}_train_sparse_matrix.npz",
-        lambda p: save_npz(p, train_arr),  # noqa: F821
-    )
-    del train_arr
-
-    loguru_logger.info("Convert to pd: Validation")
-    X_val_pd = X_val.to_pandas()
+    val_arr = ensure_csr(pipeline.transform(X_val))
     del X_val
-
-    loguru_logger.info("Pipeline: Validation")
-    val_arr = ensure_csr(pipeline.transform(X_val_pd))
-    del X_val_pd
-
-    loguru_logger.info("Saving: Validation")
-    save_and_copy(
-        FPATH.DATA / data_folder / f"{output_prefix}_val_sparse_matrix.npz",
-        lambda p: save_npz(p, val_arr),  # noqa: F821
-    )
-    del val_arr
-
-    loguru_logger.info("Convert to pd: Test")
-    X_test_pd = X_test.to_pandas()
+    test_arr = ensure_csr(pipeline.transform(X_test))
     del X_test
-
-    loguru_logger.info("Pipeline: Test")
-    test_arr = ensure_csr(pipeline.transform(X_test_pd))
-    del X_test_pd
-
-    loguru_logger.info("Saving: Test")
-    save_and_copy(
-        FPATH.DATA / data_folder / f"{output_prefix}_test_sparse_matrix.npz",
-        lambda p: save_npz(p, test_arr),  # noqa: F821
-    )
-    del test_arr
 
     loguru_logger.info("Saving sparse matrices and pipeline")
 
+    loguru_logger.info(f"Train array type: {type(train_arr)}, shape {train_arr.shape}")
     joblib.dump(
         pipeline,
         FPATH.DATA / data_folder / f"{output_prefix}_tabular_pipeline.pkl",
@@ -1406,7 +1331,32 @@ def process_tabular_data_random_splitting(
     FPATH.alternative_copy_to_opposite_drive(
         FPATH.DATA / data_folder / f"{output_prefix}_tabular_pipeline.pkl"
     )
+    save_and_copy(
+        FPATH.DATA / data_folder / f"{output_prefix}_train_sparse_matrix.npz",
+        lambda p: save_npz(p, train_arr),
+    )
+    save_and_copy(
+        FPATH.DATA / data_folder / f"{output_prefix}_val_sparse_matrix.npz",
+        lambda p: save_npz(p, val_arr),
+    )
+    save_and_copy(
+        FPATH.DATA / data_folder / f"{output_prefix}_test_sparse_matrix.npz",
+        lambda p: save_npz(p, test_arr),
+    )
 
+    loguru_logger.info("Saving target arrays")
+    save_and_copy(
+        FPATH.DATA / data_folder / f"{output_prefix}_train_y.npy",
+        lambda p: np.save(p, y_train.to_numpy()),
+    )
+    save_and_copy(
+        FPATH.DATA / data_folder / f"{output_prefix}_val_y.npy",
+        lambda p: np.save(p, y_val.to_numpy()),
+    )
+    save_and_copy(
+        FPATH.DATA / data_folder / f"{output_prefix}_test_y.npy",
+        lambda p: np.save(p, y_test.to_numpy()),
+    )
     loguru_logger.success(f"Finished processing: {output_prefix}")
 
 

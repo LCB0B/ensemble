@@ -13,23 +13,8 @@ from flash_attn.bert_padding import unpad_input
 from torch.nn.attention.flex_attention import create_block_mask
 from torch.utils.data import BatchSampler, DataLoader, WeightedRandomSampler
 
-from src.collate_fn import (
-    AutoregressiveCollate,
-    AutoregressivePredictCollate,
-    Collate,
-    FamilyAutoregressiveCollate,
-    FamilyPredictCensorCollate,
-    FamilyPredictCensorRegressionCollate,
-    MaskCollate,
-    PredictCensorCollate,
-)
-
-from src.dataset import (
-    FamilyFinetuneLMDBDataset,
-    FinetuneLMDBDataset,
-    LMDBDataset,
-)
-
+from src.collate_fn import CensorCollate, Collate, MaskCollate
+from src.dataset import FinetuneLMDBDataset, LMDBDataset
 from src.paths import FPATH, check_and_copy_file_or_dir
 from src.pipeline import DataPipeline
 from src.sampler import UnpadSampler

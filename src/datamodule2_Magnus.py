@@ -504,6 +504,7 @@ class FamilyRegressionFinetuneLifeLDM(FamilyPredictFinetuneLifeLDM):
             f"{self.lengths}_fs={feature_str}-max_seq_len={self.max_seq_len}.parquet"
         )
         path = FPATH.swap_drives(self.dir_path) / fname
+        path.parent.mkdir(exist_ok=True)
 
         if path.exists():
             print(f"Loading feature-set-aware lengths from {fname}")
@@ -599,115 +600,6 @@ class FamilyRegressionFinetuneLifeLDM(FamilyPredictFinetuneLifeLDM):
         self._lengths.write_parquet(path)
         print(f"Done determining family lengths. Saved to {fname}")
 
-    # TODO: Implement some form of censor-aware length calculation
-    # def prepare_data(self):
-    #     """Prepares data and adjusts unpadding lengths based on actual truncation logic, with caching."""
-    #     super().prepare_data()
-
-    #     if not isinstance(self._lengths, pl.DataFrame):
-    #         raise ValueError(
-    #             "Expected self._lengths to be a DataFrame after super().prepare_data()"
-    #         )
-
-    #     # Build cache filename
-    #     feature_str = "-".join(sorted(self.feature_set))
-    #     fname = f"{self.lengths}_fs={feature_str}-max_seq_len={self.max_seq_len}.parquet"
-    #     path = FPATH.swap_drives(self.dir_path) / fname
-
-    #     if path.exists():
-    #         print(f"Loading feature-set-aware lengths from {fname}")
-    #         self._lengths = pl.read_parquet(path)
-    #         return
-
-    #     print("Computing feature-set-aware lengths with family-aware truncation")
-
-    #     # Start with child lengths
-    #     df = self._lengths.rename({"length": "Child"})
-
-    #     # Find parents
-    #     parent_map = (
-    #         self.outcomes.select(
-    #             [pl.col("person_id").cast(pl.String), pl.col("parents")]
-    #         )
-    #         .explode("parents")
-    #         .unnest("parents")
-    #         .select(
-    #             [
-    #                 pl.col("person_id"),
-    #                 pl.col("parent_id").cast(str),
-    #                 pl.col("relation_details"),
-    #             ]
-    #         )
-    #     )
-    #     # Find parent lengths
-    #     parent_lengths = (
-    #         parent_map.join(
-    #             self._lengths.rename(
-    #                 {"person_id": "parent_id", "length": "parent_length"}
-    #             ),
-    #             on="parent_id",
-    #             how="left",
-    #         )
-    #         .pivot(
-    #             values="parent_length", index="person_id", columns="relation_details"
-    #         )
-    #         .fill_null(0)
-    #     )
-
-    #     # Join parent lengths
-    #     df = df.join(parent_lengths, on="person_id", how="left").fill_null(0)
-
-    #     # Ensure all family columns exist (even if 0)
-    #     for col in ["Child", "Mother", "Father"]:
-    #         if col not in df.columns:
-    #             df = df.with_columns(pl.lit(0).alias(col))
-
-    #     # Mask for which are included in feature_set
-    #     included = [
-    #         col for col in ["Child", "Mother", "Father"] if col in self.feature_set
-    #     ]
-
-    #     # Compute n_present_family_members (non-zero + in feature_set)
-    #     df = df.with_columns(
-    #         [
-    #             pl.sum_horizontal(
-    #                 [(pl.col(col) > 0).cast(pl.Int8) for col in included]
-    #             ).alias("n_present_family")
-    #         ]
-    #     )
-
-    #     # Compute truncate length per person
-    #     df = df.with_columns(
-    #         [
-    #             ((pl.lit(self.max_seq_len) // pl.col("n_present_family")))
-    #             .cast(pl.Int32)
-    #             .alias("truncate_length")
-    #         ]
-    #     )
-
-    #     # Apply min(trunc_len, member_len) for each included member
-    #     for col in included:
-    #         df = df.with_columns(
-    #             [
-    #                 pl.min_horizontal(pl.col(col), pl.col("truncate_length")).alias(
-    #                     f"{col}_used"
-    #                 )
-    #             ]
-    #         )
-
-    #     # Final effective length = sum of used lengths
-    #     df = df.with_columns(
-    #         [
-    #             pl.sum_horizontal([pl.col(f"{col}_used") for col in included])
-    #             .cast(pl.Int32)
-    #             .alias("length")
-    #         ]
-    #     )
-
-    #     self._lengths = df.select(["person_id", "length"])
-    #     self._lengths.write_parquet(path)
-    #     print(f"Done determining family lengths. Saved to {fname}")
-
 
 class FamilyAutoRegressiveDataModule(PretrainDataModule):
     def __init__(
@@ -791,6 +683,7 @@ class FamilyAutoRegressiveDataModule(PretrainDataModule):
             f"{self.lengths}_fs={feature_str}-max_seq_len={self.max_seq_len}.parquet"
         )
         path = FPATH.swap_drives(self.dir_path) / fname
+        path.parent.mkdir(exist_ok=True)
 
         if path.exists():
             print(f"Loading feature-set-aware lengths from {fname}")

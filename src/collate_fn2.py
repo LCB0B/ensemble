@@ -1,6 +1,6 @@
 """ Implements all collate functionality """
 
-from typing import Dict, List, Literal, Tuple, Union
+from typing import Dict, List, Tuple, Union, Literal
 
 import torch
 
@@ -109,12 +109,11 @@ class Collate:
             result.extend(sublist[::-1])
         else:  # If loop finished (total_length < truncate_length)
             return result[::-1], event_lens[::-1], None
-
         # Add background onto it
         for sublist in reversed(sequence[: self.bg_events]):
             result.extend(sublist[::-1])
             event_lens.append(len(sublist))
-        return result[::-1], event_lens[::-1], -i
+        return result[::-1], event_lens[::-1], -i if i > 0 else None
 
     def _pad(
         self,
@@ -169,7 +168,7 @@ class AutoregressiveCollate(Collate):
         output["target"] = output["target"].masked_fill(output["target"] == 0, -100)
         for feature in ["event", "abspos", "age", "segment"]:
             output[feature] = output[feature][:, :-1]
-        return output
+        return super().post_main(output, batch)
 
 
 class CensorCollate(Collate):
@@ -228,8 +227,8 @@ class PredictCollate(Collate):
                 continue
             truncated_seq = self._truncate(person[key], event_border)
             output[key] = truncated_seq
-
         output["event_lens"] = person_event_lens
+
         output = self.add_predict_tokens_to_person(output, person["predict"])
         person_event_lens = output.pop("event_lens")
 
@@ -265,9 +264,67 @@ class PredictCollate(Collate):
         return person
 
 
+class FamilyCollate(Collate):
+    """
+    Family-aware collate that uses prediction windows for censoring.
+    feature_set (list): List of family types to include (e.g. ["Child", "Mother"])
+    """
+
+    family_type = {"Child": 1, "Father": 2, "Mother": 3}
+
+    def __init__(self, *args, feature_set: List[str], **kwargs):
+        super().__init__(*args, **kwargs)
+        self.feature_set = feature_set
+        self.process_set = feature_set
+        self.data_keys += ["family_type"]
+
+    def pre_main(self, batch):
+        batch = super().pre_main(batch)
+        for family, outcome in zip(batch["data"], batch["outcome_info"]):
+            if "relations" in outcome:
+                family["length_dict"] = {
+                    val["relations"]: val["adjusted_lengths"]
+                    for val in outcome["relations"]
+                }
+        return batch
+
+    def process_person(self, family, truncate_length=None):
+        family_seq = []
+        length_dict = family.pop("length_dict", None)
+        for typ, person in family.items():
+            if typ not in self.process_set:
+                continue
+            truncate_length = (
+                length_dict[typ] - self.background_length
+                if (len(self.feature_set) > 1)
+                and (length_dict[typ] <= self.truncate_length)
+                else self.truncate_length
+            )
+            person["family_type"] = [self.family_type[typ]] * len(person["event"])
+            if typ == "Child":
+                indv = self.process_child(person, truncate_length)
+            else:
+                indv = self.process_parent(person, truncate_length)
+
+            family_seq.append(indv)
+
+        combined = combine_and_sort_family_seq(family_seq)
+        return combined
+
+    def process_child(self, person, truncate_length):
+        return super().process_person(person, truncate_length)
+
+    def process_parent(self, person, truncate_length):
+        return super().process_person(person, truncate_length)
+
+
 class AutoregressivePredictCollate(PredictCollate, AutoregressiveCollate):
     """Autoregressive with Predict tokens"""
 
+    pass
+
+
+class AutoregressiveCensorPredictCollate(CensorCollate, AutoregressivePredictCollate):
     pass
 
 
@@ -278,7 +335,7 @@ class PredictCensorCollate(CensorCollate, PredictCollate):
         self,
         *args,
         prediction_windows: list,
-        padding_side: Literal["left", "right"] = "left",
+        padding_side: Literal["left", "right"] = None,
         **kwargs,
     ):
         PredictCollate.__init__(self, *args, **kwargs)
@@ -312,45 +369,6 @@ class PredictCensorCollate(CensorCollate, PredictCollate):
             ) >= outcome["outcome"]
             outcome["target"] = target
         return outcome_info
-
-
-class FamilyCollate(Collate):
-    """
-    Family-aware collate that uses prediction windows for censoring.
-    feature_set (list): List of family types to include (e.g. ["Child", "Mother"])
-    """
-
-    family_type = {"Child": 1, "Father": 2, "Mother": 3}
-
-    def __init__(self, *args, feature_set: List[str], **kwargs):
-        super().__init__(*args, **kwargs)
-        self.feature_set = feature_set
-        self.process_set = feature_set
-        self.data_keys += ["family_type"]
-
-    def process_person(self, family, truncate_length=None):
-        family_seq = []
-        valid_family = [key for key in family if key in self.feature_set]
-        truncate_length = self.max_seq_len // len(valid_family) - self.background_length
-        for typ, person in family.items():
-            if typ not in self.process_set:
-                continue
-            person["family_type"] = [self.family_type[typ]] * len(person["event"])
-            if typ == "Child":
-                indv = self.process_child(person, truncate_length)
-            else:
-                indv = self.process_parent(person, truncate_length)
-
-            family_seq.append(indv)
-
-        combined = combine_and_sort_family_seq(family_seq)
-        return combined
-
-    def process_child(self, person, truncate_length):
-        return super().process_person(person, truncate_length)
-
-    def process_parent(self, person, truncate_length):
-        return super().process_person(person, truncate_length)
 
 
 class FamilyPredictCensorCollate(FamilyCollate, PredictCensorCollate):
@@ -467,6 +485,9 @@ class FamilyCensorAutoregressivePredictCollate(
         return AutoregressivePredictCollate.process_person(
             self, person, truncate_length
         )
+
+    def process_parent(self, person, truncate_length):
+        return Collate.process_person(self, person, truncate_length)
 
     def add_predict_features_to_person(self, person, predictions):
         person = super().add_predict_features_to_person(person, predictions)

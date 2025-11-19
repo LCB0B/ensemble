@@ -535,18 +535,152 @@ class FamilyPretrainNanoEncoder(PretrainNanoEncoder):
         return x
 
 
+class MultiHeadFamilyRegressionFinetuneNanoEncoder(BaseNanoEncoder):
+    def __init__(self, n_predict_tokens: int, *args, **kwargs):
+        super().__init__()
+
+        self.typ_embeddings = nn.Embedding(4, self.hparams.d_model, padding_idx=0)
+        self.n_predict_tokens = n_predict_tokens
+        d_model = self.hparams["d_model"]
+
+        # One weight per decoder: (n_tokens, d_model, 1)
+        self.decoder_weights = nn.Parameter(torch.empty(n_predict_tokens, d_model, 1))
+        self.decoder_biases = nn.Parameter(torch.zeros(n_predict_tokens))
+
+        nn.init.xavier_uniform_(self.decoder_weights)
+
+        self.rmse = MeanSquaredError(squared=False)
+        self.mae = MeanAbsoluteError()
+        self.validation_step_outputs = {"target_regression": [], "preds": []}
+        self.criterion = torch.nn.MSELoss()
+
+    def embed_information(self, batch):
+        x = super().embed_information(batch)
+
+        x += self.typ_embeddings(batch["family_type"])
+
+        return x
+
+    # def standard_step(
+    #     self, batch: Dict[str, Any], batch_idx: int
+    # ) -> Tuple[torch.Tensor, torch.Tensor]:
+    #     # Forward pass
+    #     x = self.forward(batch, repad=False)
+
+    #     # Select hidden states (1 = CLS/PREDICT token)
+    #     hidden_states = x[batch["event"] == 1]
+
+    #     # Decode
+    #     decoded_output = self.decoder_finetune(hidden_states).view(-1)
+
+    #     # if self.n_predict_tokens is None:
+    #     #     # One attention mask per person
+    #     #     B, _ = batch["attn_mask"].shape
+    #     #     # Remainder once viewed with 0th dimension as n people must be amount of predict tokens
+    #     #     # Requires an assumption of equal amount of predict tokens, which is the case for the regression setup
+    #     #     self.n_predict_tokens = decoded_output.view(B, -1).shape[1]
+
+    #     # Calculate loss
+    #     targets = batch["target_regression"].view(-1)
+    #     loss = self.criterion(decoded_output, targets)
+
+    #     return loss, decoded_output.detach()
+
+    def standard_step(
+        self, batch: Dict[str, Any], batch_idx: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.forward(batch, repad=False)  # shape (B, S, D)
+        B = batch["attn_mask"].shape[0]
+
+        # Mask prediction tokens
+        pred_mask = batch["event"] == 1
+        hidden_states = x[pred_mask]  # (B*T, D)
+        hidden_states = hidden_states.view(B, self.n_predict_tokens, -1)  # (B, T, D)
+
+        # Prepare for batched matmul
+        H = hidden_states.unsqueeze(2)  # (B, T, 1, D)
+        W = self.decoder_weights.unsqueeze(0)  # (1, T, D, 1)
+        logits = (H @ W).squeeze(-1).squeeze(-1)  # (B, T)
+        logits += self.decoder_biases  # (B, T)
+
+        preds = logits.view(-1)  # (B*T,)
+        targets = batch["target_regression"].view(-1)  # (B*T,)
+        loss = self.criterion(preds, targets)
+
+        return loss, preds.detach()
+
+    def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
+        loss, decoded_output = self.standard_step(batch, batch_idx)
+        self.log("val/loss", loss, sync_dist=True, batch_size=decoded_output.size(0))
+
+        # Compute metrics
+        targets = batch["target_regression"].view(-1)
+        self.validation_step_outputs["target_regression"].append(targets)
+        self.validation_step_outputs["preds"].append(decoded_output)
+
+        return loss
+
+    def on_validation_epoch_end(self):
+
+        targets = torch.cat(self.validation_step_outputs["target_regression"])
+        preds = torch.cat(self.validation_step_outputs["preds"])
+
+        self.log(
+            "RMSE",
+            self.rmse(preds * 100, targets * 100),
+            sync_dist=True,
+        )
+        self.log(
+            "MAE",
+            self.mae(preds * 100, targets * 100),
+            sync_dist=True,
+        )
+
+        targets = targets.view(-1, self.n_predict_tokens).T
+        preds = preds.view(-1, self.n_predict_tokens).T
+
+        print(
+            f"Validation end, targets shape {targets.shape}, preds shape {preds.shape}"
+        )
+        # Log for each prediction token, e.g. different time points
+        for i in range(self.n_predict_tokens):
+            self.log(
+                f"RMSE_predict_token_{i + 1}",
+                self.rmse(preds[i] * 100, targets[i] * 100),
+                sync_dist=True,
+            )
+            self.log(
+                f"MAE_predict_token_{i + 1}",
+                self.mae(preds[i] * 100, targets[i] * 100),
+                sync_dist=True,
+            )
+
+        self.validation_step_outputs["target_regression"].clear()
+        self.validation_step_outputs["preds"].clear()
+
+    def predict_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
+        x = self.forward(batch, repad=False)
+        B = batch["attn_mask"].shape[0]
+
+        pred_mask = batch["event"] == 1
+        hidden_states = x[pred_mask].view(B, self.n_predict_tokens, -1)  # (B, T, D)
+
+        H = hidden_states.unsqueeze(2)  # (B, T, 1, D)
+        W = self.decoder_weights.unsqueeze(0)  # (1, T, D, 1)
+        logits = torch.matmul(H, W).squeeze(-1).squeeze(-1)  # (B, T)
+        logits += self.decoder_biases  # (B, T)
+
+        return logits.view(-1)
+
+
 class FamilyRegressionFinetuneNanoEncoder(BaseNanoEncoder):
     def __init__(self, *args, **kwargs):
         super().__init__()
 
         self.typ_embeddings = nn.Embedding(4, self.hparams.d_model, padding_idx=0)
 
-        self.metrics = nn.ModuleDict(
-            {
-                "MSE": MeanSquaredError(),
-                "MAE": MeanAbsoluteError(),
-            }
-        )
+        self.rmse = MeanSquaredError(squared=False)
+        self.mae = MeanAbsoluteError()
 
         self.validation_step_outputs = {"target_regression": [], "preds": []}
         self.decoder_finetune = nn.Linear(
@@ -565,16 +699,21 @@ class FamilyRegressionFinetuneNanoEncoder(BaseNanoEncoder):
     def standard_step(
         self, batch: Dict[str, Any], batch_idx: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
         # Forward pass
         x = self.forward(batch, repad=False)
 
         # Select hidden states (1 = CLS/PREDICT token)
         hidden_states = x[batch["event"] == 1]
-        # Decode and sigmoid
-        decoded_output = torch.sigmoid(self.decoder_finetune(hidden_states)).view(-1)
+
+        # Decode
+        decoded_output = self.decoder_finetune(hidden_states).view(-1)
 
         if self.n_predict_tokens is None:
+            # One attention mask per person
             B, _ = batch["attn_mask"].shape
+            # Remainder once viewed with 0th dimension as n people must be amount of predict tokens
+            # Requires an assumption of equal amount of predict tokens, which is the case for the regression setup
             self.n_predict_tokens = decoded_output.view(B, -1).shape[1]
 
         # Calculate loss
@@ -599,24 +738,35 @@ class FamilyRegressionFinetuneNanoEncoder(BaseNanoEncoder):
         targets = torch.cat(self.validation_step_outputs["target_regression"])
         preds = torch.cat(self.validation_step_outputs["preds"])
 
-        for name, metric in self.metrics.items():
-            self.log(
-                name,
-                metric(preds, targets),
-                sync_dist=True,
-            )
+        self.log(
+            "RMSE",
+            self.rmse(preds, targets),
+            sync_dist=True,
+        )
+        self.log(
+            "MAE",
+            self.mae(preds, targets),
+            sync_dist=True,
+        )
 
-        targets = targets.view(self.n_predict_tokens, -1)
-        preds = preds.view(self.n_predict_tokens, -1)
+        targets = targets.view(-1, self.n_predict_tokens).T
+        preds = preds.view(-1, self.n_predict_tokens).T
 
+        print(
+            f"Validation end, targets shape {targets.shape}, preds shape {preds.shape}"
+        )
         # Log for each prediction token, e.g. different time points
         for i in range(self.n_predict_tokens):
-            for name, metric in self.metrics.items():
-                self.log(
-                    f"{name}_predict_token_{i + 1}",
-                    metric(preds[i], targets[i]),
-                    sync_dist=True,
-                )
+            self.log(
+                f"RMSE_predict_token_{i + 1}",
+                self.rmse(preds[i], targets[i]),
+                sync_dist=True,
+            )
+            self.log(
+                f"MAE_predict_token_{i + 1}",
+                self.mae(preds[i], targets[i]),
+                sync_dist=True,
+            )
 
         self.validation_step_outputs["target_regression"].clear()
         self.validation_step_outputs["preds"].clear()
@@ -625,6 +775,6 @@ class FamilyRegressionFinetuneNanoEncoder(BaseNanoEncoder):
         x = self.forward(batch, repad=False)
 
         hidden_states = x[batch["event"] == 1]
-        decoded_output = torch.sigmoid(self.decoder_finetune(hidden_states))
+        decoded_output = self.decoder_finetune(hidden_states)
 
         return decoded_output

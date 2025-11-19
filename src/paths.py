@@ -18,7 +18,7 @@ class ProjectPaths:
     Class containing file paths for the project directory and its subdirectories.
     """
 
-    def __init__(self, k_home: str = "/home/louibo/ensemble") -> None:
+    def __init__(self, k_home: str = "project2vec/project2vec") -> None:
         """
         Initialize the ProjectPaths class with base directory.
 
@@ -26,14 +26,14 @@ class ProjectPaths:
             k_home (str): The base directory of the project.
         """
         if platform.system() == "Linux":
-            self.FPATH_PROJECT = Path(f"{k_home}")
-            self.FPATH_D_DRIVE =  Path(f"{k_home}")
+            self.FPATH_PROJECT = Path(f"/home/{getpass.getuser()}/kdrev/{k_home}")
+            self.FPATH_D_DRIVE = Path(rf"/mnt/dwork/users/{getpass.getuser()}")
         else:
             self.FPATH_PROJECT = Path(rf"K:/{k_home}")
             self.FPATH_D_DRIVE = Path(rf"D:/work/{getpass.getuser()}")
 
-        self.DATA = self.FPATH_D_DRIVE / "data" 
-        self.NETWORK_DATA = self.FPATH_PROJECT / "data" 
+        self.DATA = self.FPATH_D_DRIVE / "data"
+        self.NETWORK_DATA = self.FPATH_PROJECT / "data"
         # TODO: Decide whether to log to local or network
         # self.CHECKPOINTS: Path = self.FPATH_D_DRIVE / "checkpoints"
         self.CHECKPOINTS = self.FPATH_PROJECT / "checkpoints"
@@ -52,9 +52,6 @@ class ProjectPaths:
         self.TB_LOGS = self.LOGS / "transformer_logs"
         self.BASELINE_LOGS = self.LOGS / "tabular_logs"
         self.OPTUNA = self.LOGS / "optuna"
-        self.DEFAULT_MODEL = self.CHECKPOINTS_TRANSFORMER / 'destiny' / 'model'  / 'best.ckpt'
-        self.DEFAULT_HPARAMS = self.CONFIGS /'destiny' / 'hparams_destiny_pretrain.yaml'
-        self.EMBEDDINGS = self.FPATH_PROJECT / "embeddings"
 
     def swap_drives(self, fpath: Path):
         """Swaps the drive of fpath by checking parts and replacing with opposite drive"""
@@ -160,7 +157,8 @@ def get_wandb_runid(file_dir: Path):
     # fmt: on
 
     if len(files := list(file_dir.glob("*"))) > 0:
-        run_number = int(max(files, key=lambda f: f.stat().st_mtime).stem.split("_")[0])
+        # run_number = int(max(files, key=lambda f: f.stat().st_mtime).stem.split("_")[0])
+        run_number = max([int(file.stem.split("_")[0]) for file in files])
         run_number = str(run_number + 1).zfill(3)
     else:
         run_number = "001"
