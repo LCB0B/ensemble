@@ -16,6 +16,91 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import torch
 
+from lightning.pytorch.plugins.io import TorchCheckpointIO
+import lightning.pytorch.tuner.batch_size_scaling as bss
+from lightning.pytorch.tuner.tuning import Tuner
+
+
+class LegacyTorchCheckpointIO(TorchCheckpointIO):
+    """Implements torch.load with a `weights_only` keyword"""
+
+    def load_checkpoint(self, path, map_location=None):
+        """Implements torch.load with a `weights_only` keyword"""
+        return torch.load(path, map_location=map_location, weights_only=False)
+
+
+def auto_ntokens(
+    trainer,
+    model,
+    datamodule,
+    buffer=0.8,
+    init_val=200_000,
+    max_trials=4,
+    steps_per_trial=50,
+):
+    """Tunes the n_tokens of datamodule to fit in memory"""
+
+    # Monkey-patch for n_tokens > len(dataset)
+    def foo(
+        trainer,
+        batch_arg_name="n_tokens",
+        factor=1.0,
+        value=None,
+        desc=None,
+        max_val=None,
+    ):
+        from lightning.pytorch.utilities.parsing import (
+            lightning_getattr,
+            lightning_setattr,
+        )
+        from lightning.pytorch.utilities.rank_zero import rank_zero_info
+
+        model = trainer.lightning_module
+        batch_size = lightning_getattr(model, batch_arg_name)
+        new_size = value if value is not None else int(batch_size * factor)
+
+        if desc:
+            rank_zero_info(
+                f"Batch size {batch_size} {desc}, trying batch size {new_size}"
+            )
+        changed = new_size != batch_size
+        lightning_setattr(model, batch_arg_name, new_size)
+        return new_size, changed
+
+    bss._adjust_batch_size = foo
+
+    tuner = Tuner(trainer)
+    final_tokens = tuner.scale_batch_size(
+        model,
+        datamodule=datamodule,
+        mode="binsearch",
+        batch_arg_name="n_tokens",
+        init_val=init_val,
+        steps_per_trial=steps_per_trial,
+        max_trials=max_trials,
+    )
+    # Scale final_tokens with buffer (To be safe for OOM)
+    final_tokens = int(final_tokens * buffer)
+    datamodule.n_tokens = final_tokens
+    return final_tokens
+
+
+def get_n_steps_per_epoch(datamodule):
+    """Gets number of steps per epoch"""
+    # Adjust n_steps and warmup
+    sampler = datamodule.get_sampler(datamodule.train_dataset)
+    avg_batch_size = datamodule.n_tokens / (sum(sampler.lengths) / len(sampler.lengths))
+    n_steps = len(datamodule.train_dataset) / avg_batch_size
+    print(f"Info: Steps ~{int(n_steps)} per epoch")
+    return n_steps
+
+
+def set_warmup_steps(model, n_steps, warmup_epochs):
+    """Calculates and sets the warmup steps for the model's optimizer"""
+    warmup_steps = int(n_steps * warmup_epochs)
+    print(f"Info: Warmup is {warmup_steps} steps ({warmup_epochs} epochs)")
+    model.update_warmup_steps(warmup_steps)
+
 
 # Taken from https://github.com/huggingface/transformers/blob/75f15f39a0434fe7a61385c4677f2700542a7ba6/src/transformers/data/data_collator.py#L817
 def mask_inputs(
@@ -101,7 +186,7 @@ def get_pnrs(sources: Union[ds.Dataset, List[ds.Dataset]]) -> pa.Array:
         )
 
 
-def create_weights(outcomes: list[int], op=lambda x: x) -> torch.Tensor:
+def create_weights(outcomes: list[int], op=lambda x: x, pprint=True) -> torch.Tensor:
     """
     Creates weights for a outcome list to be used in a WeightedRandomSampler.
 
@@ -116,7 +201,8 @@ def create_weights(outcomes: list[int], op=lambda x: x) -> torch.Tensor:
 
     # Calculate weight for each class with optional operation
     weights = {key: 1 / op(count) for key, count in counter.items()}
-    print("Sampling with weights: ", weights)
+    if pprint:
+        print("Sampling with weights: ", weights)
 
     # Assign weights to each element in the outcomes list
     sample_weights = [weights[outcome] for outcome in outcomes]
@@ -143,7 +229,7 @@ def calculate_abspos(
     return (date_col - origin_point).dt.total_seconds() / 60 / 60  # hours
 
     # return (date_col - origin_point).dt.total_seconds() / 60 / 60 / 24 # days
- 
+
 
 def calculate_datetime_from_abspos(
     abspos_col: pl.Expr, origin_point=pl.datetime(2020, 1, 1, time_unit="ns")
