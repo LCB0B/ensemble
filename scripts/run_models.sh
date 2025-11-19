@@ -1,1 +1,0 @@
-python pretrain_nanoencoder.py; python finetune_nanoencoder.py; python inference_nanoencoder.py
