@@ -20,13 +20,12 @@ max_seq_len: 8192 #512*3 total
 # Model info
 subset_background: False
 # Some additional info
-max_epochs: 6
+max_epochs: 5
 precision: 16-mixed
 float32_matmul_precision: medium
 # Data config
-experiment_name: destiny-pretrain
-dir_path: destiny_dataset
-lengths: lengths
+experiment_name: new_data_test
+dir_path: destiny_dataset2
 source_dir: destiny
 background: background
 cohorts:

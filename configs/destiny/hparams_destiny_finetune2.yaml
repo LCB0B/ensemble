@@ -1,37 +1,46 @@
+outcome: outcomes/HEA_Schizophrenia
+n_tokens: 1100000 #srv 9 #bg: 200000 #full: 800000 #labour: 1500000 #lpr: 150000 #health: 350000 #lpr_lmdb: 700000
+auto_ntokens: False
+load_pretrained_model: destiny-pretrain/001_expensive_lynx-pretrain-destiny_dataset/best.ckpt
+# load_pretrained_model: destiny-pretrain/018_stormy_stallion-pretrain-destiny_dataset_nohealth/best.ckpt
+# checkpoint: null
+dir_path: destiny_dataset2
 # Model info
 d_model: 256
 num_heads: 4
 num_layers: 4
 dropout: 0.1
 bias: False
-swiglu: False
 # Optimizer info
 beta1: 0.9
 beta2: 0.999
 weight_decay: 0.1
-learning_rate: 0.0003 #0.00001
-# warmup_steps: 50000
-warmup_epochs: 1.5
+learning_rate: 0.00001 #0.00003 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+warmup_steps: 0
+warmup_epochs: 2
 # Dataloading info
-n_tokens: 180000 # full: 180000  health: 250000  edu: 450000  labour: 450000  LPR: 350000   LPR_AMRUN: 325000   LPR_LMDB: 325000  #LMDB: 600000
-num_workers: 0
-pretrain_style: AR
-max_seq_len: 8192 #512*3 total
-# Model info
-subset_background: False
+num_workers: 8
+max_seq_len: 8192
 # Some additional info
-max_epochs: 6
+max_epochs: 5
 precision: 16-mixed
 float32_matmul_precision: medium
 # Data config
-experiment_name: destiny-pretrain
-dir_path: destiny_dataset
+subset_background: False
+experiment_name: destiny-finetune
 lengths: lengths
 source_dir: destiny
 background: background
 cohorts:
   train: cohort/train
   val: cohort/val
+prediction_windows:
+  - 1000
+pred_times:
+  - "-10y"
+  - "-5y"
+  - "-3y"
+  - "-1y"
 sources: []
   # # Demographics
   # - address_change

@@ -1,0 +1,80 @@
+# Model info
+d_model: 256
+num_heads: 4
+num_layers: 4
+dropout: 0.1
+bias: False
+swiglu: False
+# Optimizer info
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.1
+learning_rate: 0.0003 #0.00001
+warmup_epochs: 1.5
+# Dataloading info
+n_tokens: 180000 # full: 180000  health: 250000  edu: 450000  labour: 450000  LPR: 350000   LPR_AMRUN: 325000   LPR_LMDB: 325000  #LMDB: 600000
+num_workers: 10
+pretrain_style: AR
+max_seq_len: 8192 #512*3 total
+# Model info
+subset_background: False
+sep_token: False
+# Some additional info
+max_epochs: 5
+precision: 16-mixed
+float32_matmul_precision: medium
+# Data config
+experiment_name: gpt
+dir_path: destiny_dataset_att_bs
+lengths: lengths
+source_dir: destiny
+background: background
+cohorts:
+  train: cohort/train
+  val: cohort/val
+ignore_tokens:
+  - "["
+sources:
+  # ATT tokens
+  #- att_year
+  - att_birthday
+  - att_season
+  # Demographics
+  - address_change
+  - bef_updates
+  - family_births_deaths
+  - marital_status
+  - migration
+  # Labour & income
+  - akm
+  - amrun
+  - ind
+  # Health
+  - lmdb
+  - lpr
+  - sygesik
+  # Education
+  - primary_school_grades
+  - high_school_grades
+  - higher_ed_grades
+  - enrollment
+  - graduation
+  - diploma_grades
+  - qualifications
+  - wellbeing
+  - national_tests
+  - absences
+  # Social conditions
+  - decisions
+  - charges
+  - conferred_charges
+  - minor_charges
+  - victims
+  - jail_parole_start
+  - jail_end
+  - parole_end
+  - out_of_home_placements
+  - drug_treatment_start
+  - drug_treatment_end
+  - preventative_measures_start
+  - preventative_measures_end
